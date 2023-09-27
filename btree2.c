@@ -37,6 +37,22 @@ typedef unsigned long ULONG;
 STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #endif
 
+#define ZERO(s, n) memset((s), 0, (n))
+
+#define S7(A, B, C, D, E, F, G) A##B##C##D##E##F##G
+#define S6(A, B, C, D, E, F, ...) S7(A, B, C, D, E, F, __VA_ARGS__)
+#define S5(A, B, C, D, E, ...) S6(A, B, C, D, E, __VA_ARGS__)
+#define S4(A, B, C, D, ...) S5(A, B, C, D, __VA_ARGS__)
+#define S3(A, B, C, ...) S4(A, B, C, __VA_ARGS__)
+#define S2(A, B, ...) S3(A, B, __VA_ARGS__)
+#define S(A, ...) S2(A, __VA_ARGS__)
+
+#define KBYTES(x) ((size_t)(x) << 10)
+#define MBYTES(x) ((size_t)(x) << 20)
+#define GBYTES(x) ((size_t)(x) << 30)
+#define TBYTES(x) ((size_t)(x) << 40)
+#define PBYTES(x) ((size_t)(x) << 50)
+
 
 #define __packed        __attribute__((__packed__))
 #define UNUSED(x) ((void)(x))
@@ -54,8 +70,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define SUCC(x) ((x) == BT_SUCC)
 
 
-/* #define BT_MAPADDR  ((void*)0x10000) /\* ;;: change constant *\/ */
-#define BT_MAPADDR  ((void*)0x200000000000) /* ;;: change constant */
+#define BT_MAPADDR  ((void*) S(0x2000,0000,0000))
 
 #define BT_PAGEBITS 14ULL
 #define BT_PAGEWORD 32ULL
@@ -63,10 +78,18 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
 /*
   FO2BY: file offset to byte
-  get byte index into pma map from file offset
+  get byte INDEX into pma map from file offset
 */
 #define FO2BY(fo)                               \
   ((uint64_t)(fo) << BT_PAGEBITS)
+
+/*
+  BY2FO: byte to file offset
+  get pgno from byte INDEX into pma map
+*/
+#define BY2FO(p)                                \
+  ((pgno_t)((p) >> BT_PAGEBITS))
+
 /*
   FO2PA: file offset to page
   get a reference to a BT_page from a file offset
@@ -114,20 +137,12 @@ struct BT_kv {
   pgno_t fo;
 };
 
-/* /\* ;;: tmp tmp tmp *\/ */
-/* typedef struct BT_kvk BT_kvk; */
-/* struct BT_kvk { */
-/*   vaof_t lo; */
-/*   pgno_t fo; */
-/*   vaof_t hi; */
-/* }; */
-
 /* ;;: todo, perhaps rather than an index, return the data directly and typecast?? */
 #define BT_dat_lo(i) ((i) * 2)
 #define BT_dat_fo(i) ((i) * 2 + 1)
 #define BT_dat_hi(i) ((i) * 2 + 2)
 
-#define BT_dat_lo2(I, dat) 
+#define BT_dat_lo2(I, dat)
 #define BT_dat_fo2(I, dat)
 #define BT_dat_hi2(I, dat)
 
@@ -194,13 +209,14 @@ typedef struct BT_state BT_state;
 struct BT_state {
   uint16_t      flags;          /* ;;: rem */
   int           data_fd;
-  int           meta_fd;        /* ;;: confident can be removed because we're not explicitly calling write() */
+  int           meta_fd; /* ;;: confident can be removed because we're not explicitly calling write() */
   char         *path;
-  ULONG         branch_page_cnt;          /* ;;: rem */
-  ULONG         leaf_page_cnt;          /* ;;: rem */
-  ULONG         depth;          /* ;;: rem */
+  ULONG         branch_page_cnt; /* ;;: rem */
+  ULONG         leaf_page_cnt;   /* ;;: rem */
+  ULONG         depth;           /* ;;: rem */
   void         *fixaddr;
   BYTE         *map;
+  BT_page      *node_freelist;
   BT_meta      *meta_pages[2];  /* double buffered */
   unsigned int  which;          /* which double-buffered db are we using? */
 };
@@ -210,35 +226,17 @@ struct BT_state {
 //// ===========================================================================
 ////                            btree internal routines
 
-/* typedef struct BT_findpath BT_findpath; */
-/* struct BT_findpath { */
-/*   BT_dat *path[4];              /\* ;;: todo #DEFINE maxdepth *\/ */
-/*   size_t idx[4];                /\* ;;: why do we need idx again? We're storing */
-/*                                      POINTERS to the dat *\/ */
-/*   uint8_t depth; */
-/* }; */
-
+#define BT_MAXDEPTH 4           /* ;;: todo derive it */
 typedef struct BT_findpath BT_findpath;
 struct BT_findpath {
-  BT_page *path[4];             /* ;;: todo #DEFINE maxdepth */
-  size_t idx[4];                /* ;;: why do we need idx again? We're storing
-                                     POINTERS to the dat */
+  BT_page *path[BT_MAXDEPTH];
+  size_t idx[BT_MAXDEPTH];
   uint8_t depth;
 };
 
-/* ;;: duh */
-
-/* static int */
-/* _bt_findpath_new(BT_findpath **path) */
-/* { */
-/*   BT_findpath *p = calloc(1, sizeof *p); */
-/*   *path = p; */
-/*   return BT_SUCC; */
-/* } */
-
-/* get_node: get a pointer to a node stored at file offset pgno */
+/* _node_get: get a pointer to a node stored at file offset pgno */
 static BT_page *
-_get_node(BT_state *state, pgno_t pgno)
+_node_get(BT_state *state, pgno_t pgno)
 {
   /* TODO: eventually, once we can store more than 2M of nodes, this will need
      to reference the meta page's blk_base array to determine where a node is
@@ -249,14 +247,40 @@ _get_node(BT_state *state, pgno_t pgno)
   - sector that contains node is i-1
   - appropriately offset into i-1th fixed size partition: 2M, 8M, 16M, ...
 
+
+
   */
 
   /* for now, this works because the 2M sector is at the beginning of both the
      memory arena and pma file
   */
-  /* ;;: fix assert - 2M */
-  /* assert(); */
+  assert((pgno * BT_PAGESIZE) < MBYTES(2));
   return FO2PA(state->map, pgno);
+}
+
+/* ;;: I don't think we should need this if _node_alloc also returns a disc offset */
+static pgno_t
+_fo_get(BT_state *state, BT_page *node)
+{
+  uintptr_t vaddr = (uintptr_t)node;
+  uintptr_t start = (uintptr_t)state->map;
+  return BY2FO(vaddr - start);
+}
+
+static BT_page *
+_node_alloc(BT_state *state)
+{
+  /* TODO: will eventually need to walk a node freelist that allocs space for
+     the striped node partitions. Since this is unimplemented, just allocating
+     space from first 2M */
+
+  /* ;;: when node freelist is implemented, will we need to return the file
+       offset of the node as well? This is important for splitting where we
+       allocate a new node and need to store its file offset in the parent's
+       data index */
+  size_t width = (BYTE *)state->node_freelist - state->map;
+  assert(width < MBYTES(2));
+  return state->node_freelist++;
 }
 
 /* binary search a page's data section for a va. Returns a pointer to the found BT_dat */
@@ -277,11 +301,9 @@ _bt_bsearch(BT_page *page, vaof_t va)
 
 /* ;;: find returns a path to nodes that things should be in if they are there. */
 /* a leaf has a meta page depth eq to findpath depth */
-
-/* ;;: I don't believe we actually need this findpath struct. See introduction
-     to algorithms chp 18: B-Trees */
 static int
-_bt_find2(BT_page *page,
+_bt_find2(BT_state *state,
+          BT_page *page,
           BT_findpath *path,
           uint8_t maxdepth,
           vaof_t lo,
@@ -292,48 +314,11 @@ _bt_find2(BT_page *page,
      If at depth of metapage (a leaf), then done
      otherwise grab node, increment depth, save node in path
   */
-  uint8_t depth = path->depth;
-  
   if (path->depth > maxdepth)
     return ENOENT;
 
-  
-  /* ;;: rev1 */
-  BT_dat *dat, *d;
-  dat = d = &page->datd[0];
-  if (is_leaf(depth, maxdepth)) {
-    for (; d < BT_dat_maxva(page); d += 2) {
-      vaof_t llo = d->va;
-      vaof_t hhi = (d + 2)->va;
-      if (llo <= lo && hhi >= hi) {
-        path->idx[path->depth] = d / 2;
-        path->path[path->depth] = page;
-        return BT_SUCC;
-      }
-    }
-    return ENOENT;
-  }
-  /* then branch */
-  else {
-    for (; d < BT_dat_maxva(page); d += 2) {
-      vaof_t llo = d->va;
-      vaof_t hhi = (d + 2)->va;
-      if (llo <= lo && hhi >= hi) {
-        pgno_t fo = (d + 1)->fo;
-        BT_page *child = _get_node(state, fo);
-        path->idx[depth] = d;
-        path->path[depth] = page;
-        path->depth++;
-        return _bt_find2(child, path, maxdepth, lo, hi);
-      }
-    }
-    return ENOENT;
-  }
-
-  
-  /* ;;: rev2 */
   size_t i = 0;
-  if (is_leaf(depth, maxdepth)) {
+  if (is_leaf(path->depth, maxdepth)) {
     for (; i < BT_DAT_MAXKEYS - 1; i++) {
       vaof_t llo = page->datk[i].va;
       vaof_t hhi = page->datk[i + 1].va;
@@ -352,63 +337,192 @@ _bt_find2(BT_page *page,
       vaof_t hhi = page->datk[i + 1].va;
       if (llo <= lo && hhi >= hi) {
         pgno_t fo = page->datk[i].fo;
-        BT_page *child = _get_node(state, fo);
-        path->idx[depth] = i;
-        path->path[depth] = page;
+        BT_page *child = _node_get(state, fo);
+        path->idx[path->depth] = i;
+        path->path[path->depth] = page;
         path->depth++;
-        return _bt_find2(child, path, maxdepth, lo, hi);
+        return _bt_find2(state, child, path, maxdepth, lo, hi);
       }
     }
     return ENOENT;
   }
-  
-  /* /\* ;;: *\/ */
-  /* BT_kv *kv = &page->datk[0]; */
-  /* if (is_leaf(depth, maxdepth)) { */
-  /*   for (; kv <= BT_dat_maxva(page); kv++) { */
-  /*     if (kv->va == lo) { */
-  /*       path->path[depth] = (BT_dat *)&kv->fo; */
-  /*       return BT_SUCC; */
-  /*     } */
-  /*   } */
-  /*   return ENOENT; */
-  /* }      if (llo <= lo && hhi >= hi) { */
-  /* /\* then branch *\/ */
-  /* else { */
-  /*   for (; kv <= BT_dat_maxva(page); kv++) { */
-  /*     /\* found entry (but overstepped by one) *\/ */
-  /*     if (kv->va >= hi) { */
-  /*       assert(kv != &page->datk[0]); */
-  /*       BT_kv *ent = kv - 1; */
-  /*       path->path[depth] = (BT_dat *)ent; */
-  /*       path->depth = depth++; */
-  /*       return _bt_find2(page, path, maxdepth, lo, hi); */
-  /*     } */
-  /*   } */
-  /*   return ENOENT; */
-  /* } */
 }
 
 static int
 _bt_find(BT_state *state, BT_findpath *path, vaof_t lo, vaof_t hi)
 {
   BT_meta *meta = state->meta_pages[state->which];
-  BT_page *root = _get_node(state, meta->root);
+  BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
-  return _bt_find2(root, path, maxdepth, lo, hi);
+  return _bt_find2(state, root, path, maxdepth, lo, hi);
 }
 
 static int
-_bt_split(BT_findpath *path, BT_page *node)
+_bt_findpath_is_root(BT_findpath *path)
+{
+  assert(path != 0);
+  return path->depth == 0;
+}
+
+/* _bt_node_nexthole: find next empty space in node's data section. Returned as
+   index into node->datk. If the node is full, return is BT_DAT_MAXKEYS */
+static size_t
+_bt_node_nexthole(BT_page *node)
+{
+  size_t i = 0;
+  for (; i < BT_DAT_MAXKEYS; i++) {
+    if (node->datk[i].fo == 0) break;
+  }
+  return i;
+}
+
+/* _bt_split_datcopy: copy right half of left node to right node */
+static int
+_bt_split_datcopy(BT_page *left, BT_page *right)
+{
+  size_t mid = BT_DAT_MAXKEYS / 2;
+  size_t bytelen = mid * sizeof(left->datk[0]);
+  /* copy rhs of left to right */
+  memcpy(right->datk, &left->datk[mid], bytelen);
+  /* zero rhs of left */
+  ZERO(&left->datk[mid], bytelen);
+
+  return BT_SUCC;
+}
+
+
+static int
+_bt_dirtychild(BT_page *parent, size_t child_idx)
+{
+  /* ;;: given a data to the child, marks the page dirty in the parent
+
+    ;;: is this correct? Also, TODO: generalize it */
+  child_idx >>= sizeof(parent->head.dirty[0]);
+  parent->head.dirty[child_idx] |= child_idx;
+  /* ;;: we also have to dirty the parent of the parent and so on, right?? In
+       which case, we need a path. These operations would probably be much
+       simpler if child pages stored back references to parents. I believe they
+       do in lmdb. */
+  return BT_SUCC;
+}
+
+/* ;;: this needs to be looked at much more closely. */
+static int
+_bt_split(BT_state *state, BT_findpath *path, BT_page *node) /* ;;: you don't need the node argument since it's included in path. Note, it may make sense to split out the index as a param to _bt_split instead of only passing it in path to minimize funcall stack size */
+{
+  assert(path != 0);
+  size_t depth = path->depth;
+
+  /* if we need to split a root, need to create a new root page and increment
+     btree depth */
+  if (_bt_findpath_is_root(path)) {
+    pgno_t pg = 0;
+    BT_meta *meta = state->meta_pages[state->which];
+    /* the old root is now the left child of the new root */
+    BT_page *left = _node_get(state, path->idx[depth]);
+    BT_page *right = _node_alloc(state);
+    BT_page *new_root = _node_alloc(state);
+    /* dirty metapage and set new root */
+    meta->flags |= BP_DIRTY;
+    meta->root = _fo_get(state, new_root);
+    /* split data of left across left and right */
+    _bt_split_datcopy(left, right);
+    /* save left and right as first two pages of new root */
+    pg = _fo_get(state, left);
+    new_root->datk[0].fo = pg;
+    new_root->datk[0].va = left->datk[0].va; /* ;;: not correct. va should be first va in pg */
+    pg = _fo_get(state, right);
+    new_root->datk[1].fo = pg;
+    new_root->datk[1].va = right->datk[0].va;
+    /* finally, dirty the children */
+    _bt_dirtychild(new_root, 0);
+    _bt_dirtychild(new_root, 1);
+
+    return BT_SUCC;
+  }
+
+  /* non-recursive case, sufficient space in parent node */
+  BT_page *parent = path->path[depth];
+  BT_page *child = _node_get(state, path->idx[depth]);
+  size_t hole_idx = _bt_node_nexthole(parent);
+
+  if (hole_idx == BT_DAT_MAXKEYS) {
+    /* insufficient space in parent, so split parent by recursing */
+    int rc = _bt_split(state, &(BT_findpath){
+        /* ;;: horrible. Just split out depth as param since the rest of the findpath data is invariant */
+        .depth = path->depth -1,
+        .idx = {path->idx[0], path->idx[1], path->idx[2], path->idx[3]},
+        .path = {path->path[0], path->path[1], path->path[2], path->path[3]},
+      },
+      node);
+    assert(SUCC(rc));
+  }
+
+  /* sufficient space in parent to split child and just insert */
+  BT_page *new_child = _node_alloc(state);
+  _bt_split_datcopy(child, new_child);
+  pgno_t new_pg = _fo_get(state, new_child);
+  parent->datk[hole_idx].fo = new_pg;
+  parent->datk[hole_idx].va = new_child->datk[0].va;
+  _bt_dirtychild(parent, hole_idx);
+
+  return BT_SUCC;
+}
+
+
+static int
+__bt_split(BT_state *state, BT_findpath *path, BT_page *node)
 {
   /* split actually does the CoW for _bt_insert. bt_insert doesn't for non-full
-     nodes */
+     nodes.
+
+    ;;: should we return the new node or modify path to point to it?? */
+  uint8_t depth = path->depth;
+  BT_page *new = _node_alloc(state);
+  size_t median = BT_DAT_MAXKEYS / 2;
+  memcpy(new->datk, node->datk, median);
+
+  /* need parent node as well.
+     first, dirty both old page and new page
+     next, copy range (median,end) of old node to new node
+       ?? Do we need to allocate two nodes?
+     next, insert new node into parent, splitting parent if necessary
+
+     ***
+
+     split actually probably SHOULD walk the parents in path. Since we can't
+     insert into a full parent. Therefore:
+
+     null case 1:
+
+       if root node, then allocate two new nodes A and B. Copy right half of
+       old.datk to A.datk. Make B the new root and point index 0 at A and index
+       1 at B.
+
+     null case 2:
+
+       if parent is not full, then allocate new node A. Copy right half of
+       old.datk to A.datk. Right shift range of parent to make room for new
+       entry. Insert ref to A next to child index i at i+1.
+
+     recursive case:
+
+       if parent is full, split parent.
+
+
+
+     ;;: should we enforce that a root node is never a leaf? This may simplify
+       the split logic a bit.
+   */
+
   return 255;
 }
 
 static int
 _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 {
+  /* ;;: old implementation was incorrect and removed -- relied on different
+       implementation of _bt_split. Need to reimplement */
   BT_findpath path = {0};
   int rc;
   if (!SUCC(rc = _bt_find(state, &path, lo, hi))) {
@@ -421,7 +535,7 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
      BT_page[2M / sizeof(BT_page)] array in state. error out when size is
      exceeded.
   */
-  return;
+  return 255;
 }
 
 static int
@@ -533,6 +647,9 @@ _bt_state_load(BT_state *state)
                     state->data_fd,
                     0);
 
+  state->node_freelist = &((BT_page *)state->map)[2]; /* begin allocating nodes
+                                                       on third page (first two
+                                                       are for metadata) */
   /* new db, so populate metadata */
   if (new) {
     if (!SUCC(rc = _bt_state_meta_new(state, &meta))) {
