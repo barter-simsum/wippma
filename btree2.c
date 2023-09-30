@@ -267,7 +267,7 @@ _fo_get(BT_state *state, BT_page *node)
   return BY2FO(vaddr - start);
 }
 
-static BT_page *
+static BT_page *                /* ;;: change to return both a file and node offset as params to function. actual return value is error code */
 _node_alloc(BT_state *state)
 {
   /* TODO: will eventually need to walk a node freelist that allocs space for
@@ -280,7 +280,18 @@ _node_alloc(BT_state *state)
        data index */
   size_t width = (BYTE *)state->node_freelist - state->map;
   assert(width < MBYTES(2));
+  /* ;;: todo confirm data sections are zeroed */
   return state->node_freelist++;
+}
+
+static int
+_node_cow(BT_state *state, BT_page *node, BT_page **newnode, pgno_t *pgno)
+{
+  BT_page *ret = _node_alloc(state);
+  memcpy(ret->datk, node->datk, sizeof node->datk[0] * BT_DAT_MAXENTRIES);
+  *pgno = _fo_get(state, *newnode);
+  *newnode = ret;
+  return BT_SUCC;
 }
 
 /* binary search a page's data section for a va. Returns a pointer to the found BT_dat */
@@ -298,6 +309,21 @@ _bt_bsearch(BT_page *page, vaof_t va)
 
 #define is_leaf(d1, d2) ((d1) == (d2))
 #define is_branch(d1, d2) (!is_leaf(d1, d2))
+
+static size_t
+_bt_childidx(BT_page *node, vaof_t lo, vaof_t hi)
+/* looks up the child index in a parent node. If not found, return is
+   BT_DAT_MAXKEYS */
+{
+  size_t i = 0;
+  for (; i < BT_DAT_MAXKEYS - 1; i++) {
+    vaof_t llo = node->datk[i].va;
+    vaof_t hhi = node->datk[i+1].va;
+    if (llo <= lo && hhi >= hi)
+      return i;
+  }
+  return BT_DAT_MAXKEYS;
+}
 
 /* ;;: find returns a path to nodes that things should be in if they are there. */
 /* a leaf has a meta page depth eq to findpath depth */
@@ -317,35 +343,36 @@ _bt_find2(BT_state *state,
   if (path->depth > maxdepth)
     return ENOENT;
 
-  size_t i = 0;
-  if (is_leaf(path->depth, maxdepth)) {
-    for (; i < BT_DAT_MAXKEYS - 1; i++) {
-      vaof_t llo = page->datk[i].va;
-      vaof_t hhi = page->datk[i + 1].va;
-      if (llo <= lo && hhi >= hi) {
-        path->idx[path->depth] = i;
-        path->path[path->depth] = page;
-        return BT_SUCC;
-      }
-    }
+  size_t i;
+  if ((i = _bt_childidx(page, lo, hi)) == BT_DAT_MAXKEYS)
     return ENOENT;
+
+  if (is_leaf(path->depth, maxdepth)) {
+    path->idx[path->depth] = i;
+    path->path[path->depth] = page;
+    return BT_SUCC;
   }
   /* then branch */
   else {
-    for (; i < BT_DAT_MAXKEYS - 1; i++) {
-      vaof_t llo = page->datk[i].va;
-      vaof_t hhi = page->datk[i + 1].va;
-      if (llo <= lo && hhi >= hi) {
-        pgno_t fo = page->datk[i].fo;
-        BT_page *child = _node_get(state, fo);
-        path->idx[path->depth] = i;
-        path->path[path->depth] = page;
-        path->depth++;
-        return _bt_find2(state, child, path, maxdepth, lo, hi);
-      }
-    }
-    return ENOENT;
+    pgno_t fo = page->datk[i].fo;
+    BT_page *child = _node_get(state, fo);
+    path->idx[path->depth] = i;
+    path->path[path->depth] = page;
+    path->depth++;
+    return _bt_find2(state, child, path, maxdepth, lo, hi);
   }
+}
+
+BT_page *
+_bt_root_new(BT_state *state)
+{
+  BT_page *root = _node_alloc(state);
+  state->meta_pages[state->which]->root = _fo_get(state, root);
+  root->datk[0].va = 0;
+  root->datk[0].fo = 0;
+  root->datk[1].va = UINT32_MAX;
+  root->datk[1].fo = 0;
+  return root;
 }
 
 static int
@@ -369,11 +396,22 @@ _bt_findpath_is_root(BT_findpath *path)
 static size_t
 _bt_node_nexthole(BT_page *node)
 {
-  size_t i = 0;
+  size_t i = 1;
   for (; i < BT_DAT_MAXKEYS; i++) {
-    if (node->datk[i].fo == 0) break;
+    if (node->datk[i].va == 0) break;
   }
   return i;
+}
+
+static int
+_bt_datshift(BT_page *node, size_t i, size_t n)
+/* shift data segment at i over by n KVs */
+{
+  assert(i+n < BT_DAT_MAXKEYS); /* check buffer overflow */
+  size_t bytelen = (BT_DAT_MAXKEYS - i) * sizeof(node->datk[0]);
+  memmove(&node->datk[i+n], &node->datk[i], bytelen);
+  ZERO(&node->datk[i], n * sizeof(node->datk[0]));
+  return BT_SUCC;
 }
 
 /* _bt_split_datcopy: copy right half of left node to right node */
@@ -385,33 +423,38 @@ _bt_split_datcopy(BT_page *left, BT_page *right)
   /* copy rhs of left to right */
   memcpy(right->datk, &left->datk[mid], bytelen);
   /* zero rhs of left */
-  ZERO(&left->datk[mid], bytelen);
+  ZERO(&left->datk[mid], bytelen); /* ;;: note, this would be unnecessary if we stored node.N */
+  left->datk[mid].va = right->datk[0].va;
 
   return BT_SUCC;
 }
 
-
+/* ;;: todo, fix these */
 static int
 _bt_dirtychild(BT_page *parent, size_t child_idx)
 {
-  /* ;;: given a data to the child, marks the page dirty in the parent
-
-    ;;: is this correct? Also, TODO: generalize it */
   child_idx >>= sizeof(parent->head.dirty[0]);
-  parent->head.dirty[child_idx] |= child_idx;
-  /* ;;: we also have to dirty the parent of the parent and so on, right?? In
-       which case, we need a path. These operations would probably be much
-       simpler if child pages stored back references to parents. I believe they
-       do in lmdb. */
+  parent->head.dirty[child_idx] |= 1;
   return BT_SUCC;
+}
+static int
+_bt_ischilddirty(BT_page *parent, size_t child_idx)
+{
+  uint8_t flag = parent->head.dirty[child_idx >> 4];
+  return (flag << 4) & child_idx;
 }
 
 /* ;;: this needs to be looked at much more closely. */
+/* ;;: -- forgetting this implm. split is too tied to insert and this isn't what
+     we want. */
 static int
-_bt_split(BT_state *state, BT_findpath *path, BT_page *node) /* ;;: you don't need the node argument since it's included in path. Note, it may make sense to split out the index as a param to _bt_split instead of only passing it in path to minimize funcall stack size */
+__bt_split(BT_state *state, BT_findpath *path, size_t depth)
+/* ;::
+ first call: depth 0
+ recursive : depth+1
+*/
 {
   assert(path != 0);
-  size_t depth = path->depth;
 
   /* if we need to split a root, need to create a new root page and increment
      btree depth */
@@ -430,10 +473,11 @@ _bt_split(BT_state *state, BT_findpath *path, BT_page *node) /* ;;: you don't ne
     /* save left and right as first two pages of new root */
     pg = _fo_get(state, left);
     new_root->datk[0].fo = pg;
-    new_root->datk[0].va = left->datk[0].va; /* ;;: not correct. va should be first va in pg */
+    new_root->datk[0].va = 0;
     pg = _fo_get(state, right);
     new_root->datk[1].fo = pg;
     new_root->datk[1].va = right->datk[0].va;
+    new_root->datk[2].va = UINT32_MAX;
     /* finally, dirty the children */
     _bt_dirtychild(new_root, 0);
     _bt_dirtychild(new_root, 1);
@@ -441,20 +485,17 @@ _bt_split(BT_state *state, BT_findpath *path, BT_page *node) /* ;;: you don't ne
     return BT_SUCC;
   }
 
-  /* non-recursive case, sufficient space in parent node */
   BT_page *parent = path->path[depth];
+  /* it doesn't make sense to split a node without two entries */
+  assert(parent->datk[1].va != 0 && parent->datk[2].va != 0);
+
   BT_page *child = _node_get(state, path->idx[depth]);
   size_t hole_idx = _bt_node_nexthole(parent);
 
   if (hole_idx == BT_DAT_MAXKEYS) {
     /* insufficient space in parent, so split parent by recursing */
-    int rc = _bt_split(state, &(BT_findpath){
-        /* ;;: horrible. Just split out depth as param since the rest of the findpath data is invariant */
-        .depth = path->depth -1,
-        .idx = {path->idx[0], path->idx[1], path->idx[2], path->idx[3]},
-        .path = {path->path[0], path->path[1], path->path[2], path->path[3]},
-      },
-      node);
+    int rc = __bt_split(state, path, depth-1);
+    hole_idx = _bt_node_nexthole(parent);
     assert(SUCC(rc));
   }
 
@@ -465,77 +506,131 @@ _bt_split(BT_state *state, BT_findpath *path, BT_page *node) /* ;;: you don't ne
   parent->datk[hole_idx].fo = new_pg;
   parent->datk[hole_idx].va = new_child->datk[0].va;
   _bt_dirtychild(parent, hole_idx);
+  _bt_dirtychild(parent, hole_idx-1);
 
   return BT_SUCC;
 }
 
+#define IS_ROOT(path) ((path)->depth == 0)
 
 static int
-__bt_split(BT_state *state, BT_findpath *path, BT_page *node)
+_bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
 {
-  /* split actually does the CoW for _bt_insert. bt_insert doesn't for non-full
-     nodes.
+  /* ;;: todo: better error handling */
+  int rc = BT_SUCC;
+  BT_page *left = _node_get(state, node->datk[i].fo);
+  BT_page *right = _node_alloc(state);
+  if (right == 0)
+    return ENOMEM;
+  if (!SUCC(rc = _bt_split_datcopy(left, right)))
+    return rc;
 
-    ;;: should we return the new node or modify path to point to it?? */
-  uint8_t depth = path->depth;
-  BT_page *new = _node_alloc(state);
-  size_t median = BT_DAT_MAXKEYS / 2;
-  memcpy(new->datk, node->datk, median);
+  /* ;;: todo, we can ofc unconditionally dirty the right child since it was
+       freshly alloced. However, the left child isn't guaranteed
+       dirty. Therefore:
+         - if left is NOT dirty, CoW it and dirty it. Call data copy on
+         CoWed left and freshly alloced right
 
-  /* need parent node as well.
-     first, dirty both old page and new page
-     next, copy range (median,end) of old node to new node
-       ?? Do we need to allocate two nodes?
-     next, insert new node into parent, splitting parent if necessary
+         - if it IS ALREADY dirty, then just call data copy on original left and
+           freshly alloced right
 
-     ***
+     alternatively, assert that left is already dirt. Responsibility falls on
+     caller (insert) to ensure node being inserted into is either dirty or CoWed
+  */
 
-     split actually probably SHOULD walk the parents in path. Since we can't
-     insert into a full parent. Therefore:
+  /* dirty right child */
+  _bt_dirtychild(node, i+1);
 
-     null case 1:
+  /* ;;: fix this */
+  *newchild = _fo_get(state, right);
 
-       if root node, then allocate two new nodes A and B. Copy right half of
-       old.datk to A.datk. Make B the new root and point index 0 at A and index
-       1 at B.
+  return BT_SUCC;
+}
 
-     null case 2:
+
+static int
+_bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
+        BT_page *node, size_t depth)
+{
+  /* ;;: to be written in such a way that node is guaranteed both dirty and
+       non-full */
 
-       if parent is not full, then allocate new node A. Copy right half of
-       old.datk to A.datk. Right shift range of parent to make room for new
-       entry. Insert ref to A next to child index i at i+1.
+  /* ;;: remember:
+     - You need to CoW+dirty a node when you insert into it.
+     - You need to insert into a node when:
+       - It's a leaf
+       - It's a branch and you CoWed the child
+     - Hence, all nodes in a path to a leaf being inserted into need to already
+     be dirty or explicitly CoWed. Splitting doesn't actually factor into this
+     decision afaict.
+  */
 
-     recursive case:
+  assert(node != 0);
+  int rc = 255;
+  size_t N = _bt_node_nexthole(node);
+  size_t childidx = _bt_childidx(node, lo, hi);
+  BT_meta *meta = state->meta_pages[state->which];
 
-       if parent is full, split parent.
+  /* nullcond: node is a leaf */
+  if (meta->depth == depth) {
+    /* guaranteed non-full and dirty by n-1 recursive call, so just insert */
 
+    /* ;;: fixme the logic is more complex. Need to unify left and right
+         entries with childidx */
+    _bt_datshift(node, childidx, 1);
+    node->datk[childidx].va = lo;
+    node->datk[childidx].fo = fo;
 
+    return BT_SUCC;
+  }
 
-     ;;: should we enforce that a root node is never a leaf? This may simplify
-       the split logic a bit.
-   */
+  /* do we need to CoW the child node? */
+  if (!_bt_ischilddirty(node, childidx)) {
+    BT_page *newchild;
+    pgno_t pgno;
+    _node_cow(state, node, &newchild, &pgno);
+    node->datk[childidx].fo = pgno;
+    _bt_dirtychild(node, childidx);
+  }
 
-  return 255;
+  /* do we need to split the child node? */
+  if (N >= BT_DAT_MAXKEYS - 1) {
+      pgno_t rchild_pgno;
+      if (!SUCC(rc = _bt_split_child(state, node, childidx, &rchild_pgno)))
+        return rc;
+      /* now insert the new child into parent... */
+      /* ;;: may need to be fixed */
+      _bt_datshift(node, childidx, 1);
+      BT_page *lchild = _node_get(state, node->datk[childidx].fo);
+      BT_page *rchild = _node_get(state, rchild_pgno);
+      node->datk[childidx+1].va = rchild->datk[0].va;
+      node->datk[childidx+1].fo = rchild_pgno;
+
+      /* since we split the child's data, recalculate the child idx */
+      /* ;;: note, this can be simplified into a conditional i++ */
+      childidx = _bt_childidx(node, lo, hi);
+  }
+
+  /* the child is now guaranteed non-full (split) and dirty. Recurse */
+  BT_page *child = _node_get(state, node->datk[childidx].fo);
+  return _bt_insert2(state, lo, hi, fo, child, depth+1);
 }
 
 static int
 _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 {
-  /* ;;: old implementation was incorrect and removed -- relied on different
-       implementation of _bt_split. Need to reimplement */
   BT_findpath path = {0};
   int rc;
   if (!SUCC(rc = _bt_find(state, &path, lo, hi))) {
     return rc;
   }
-  /* path now contains PATH to leaf node at path->depth handle splitting if
-    necessary. Check all nodes in path if need to be split
-  */
-  /* "implement" basic function that bumps node allocation pointer. store
-     BT_page[2M / sizeof(BT_page)] array in state. error out when size is
-     exceeded.
-  */
-  return 255;
+  /* ;;: handle separately the root, then pass to _bt_insert2 */
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  /* ;;: split root if necessary (since it's special cased (2 allocs)) then call
+       _bt_insert2 on the root. split check and dirty check in _bt_insert2 will
+       both noop and insertion should proceed as normal */
+  return _bt_insert2(state, lo, hi, fo, root, 0);
 }
 
 static int
@@ -543,12 +638,6 @@ _bt_delete()
 {
   return 255;
 }
-
-/* bt_insert. Find interval (via _bt_find) and see if there's space in leaf to
-   insert. If not, split leaf, go up path by 1, etc.
-
-   return succ/fail
-*/
 
 #define CLOSE_FD(fd)                            \
   do {                                          \
