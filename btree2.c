@@ -218,6 +218,10 @@ struct BT_state {
   BYTE         *map;
   BT_page      *node_freelist;
   BT_meta      *meta_pages[2];  /* double buffered */
+  /* ;;: note, while meta_pages[which]->root stores a pgno, we may want to just
+       store a pointer to root in state in addition to avoid a _node_find on it
+       every time it's referenced */
+  /* BT_page      *root; */
   unsigned int  which;          /* which double-buffered db are we using? */
 };
 
@@ -444,73 +448,6 @@ _bt_ischilddirty(BT_page *parent, size_t child_idx)
   return (flag << 4) & child_idx;
 }
 
-/* ;;: this needs to be looked at much more closely. */
-/* ;;: -- forgetting this implm. split is too tied to insert and this isn't what
-     we want. */
-static int
-__bt_split(BT_state *state, BT_findpath *path, size_t depth)
-/* ;::
- first call: depth 0
- recursive : depth+1
-*/
-{
-  assert(path != 0);
-
-  /* if we need to split a root, need to create a new root page and increment
-     btree depth */
-  if (_bt_findpath_is_root(path)) {
-    pgno_t pg = 0;
-    BT_meta *meta = state->meta_pages[state->which];
-    /* the old root is now the left child of the new root */
-    BT_page *left = _node_get(state, path->idx[depth]);
-    BT_page *right = _node_alloc(state);
-    BT_page *new_root = _node_alloc(state);
-    /* dirty metapage and set new root */
-    meta->flags |= BP_DIRTY;
-    meta->root = _fo_get(state, new_root);
-    /* split data of left across left and right */
-    _bt_split_datcopy(left, right);
-    /* save left and right as first two pages of new root */
-    pg = _fo_get(state, left);
-    new_root->datk[0].fo = pg;
-    new_root->datk[0].va = 0;
-    pg = _fo_get(state, right);
-    new_root->datk[1].fo = pg;
-    new_root->datk[1].va = right->datk[0].va;
-    new_root->datk[2].va = UINT32_MAX;
-    /* finally, dirty the children */
-    _bt_dirtychild(new_root, 0);
-    _bt_dirtychild(new_root, 1);
-
-    return BT_SUCC;
-  }
-
-  BT_page *parent = path->path[depth];
-  /* it doesn't make sense to split a node without two entries */
-  assert(parent->datk[1].va != 0 && parent->datk[2].va != 0);
-
-  BT_page *child = _node_get(state, path->idx[depth]);
-  size_t hole_idx = _bt_node_nexthole(parent);
-
-  if (hole_idx == BT_DAT_MAXKEYS) {
-    /* insufficient space in parent, so split parent by recursing */
-    int rc = __bt_split(state, path, depth-1);
-    hole_idx = _bt_node_nexthole(parent);
-    assert(SUCC(rc));
-  }
-
-  /* sufficient space in parent to split child and just insert */
-  BT_page *new_child = _node_alloc(state);
-  _bt_split_datcopy(child, new_child);
-  pgno_t new_pg = _fo_get(state, new_child);
-  parent->datk[hole_idx].fo = new_pg;
-  parent->datk[hole_idx].va = new_child->datk[0].va;
-  _bt_dirtychild(parent, hole_idx);
-  _bt_dirtychild(parent, hole_idx-1);
-
-  return BT_SUCC;
-}
-
 #define IS_ROOT(path) ((path)->depth == 0)
 
 static int
@@ -556,7 +493,7 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
        non-full */
 
   /* ;;: remember:
-     - You need to CoW+dirty a node when you insert into it.
+     - You need to CoW+dirty a node when you insert a non-dirty node.
      - You need to insert into a node when:
        - It's a leaf
        - It's a branch and you CoWed the child
@@ -566,6 +503,8 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
   */
 
   assert(node != 0);
+  assert(depth > 0);            /* routine doesn't handle root splitting */
+
   int rc = 255;
   size_t N = _bt_node_nexthole(node);
   size_t childidx = _bt_childidx(node, lo, hi);
@@ -589,6 +528,7 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
     BT_page *newchild;
     pgno_t pgno;
     _node_cow(state, node, &newchild, &pgno);
+    /* ;;: fixme, further insert logic necessary obv -- wait, is it? */
     node->datk[childidx].fo = pgno;
     _bt_dirtychild(node, childidx);
   }
@@ -619,18 +559,76 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
 static int
 _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 {
-  BT_findpath path = {0};
   int rc;
-  if (!SUCC(rc = _bt_find(state, &path, lo, hi))) {
-    return rc;
-  }
+
   /* ;;: handle separately the root, then pass to _bt_insert2 */
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
-  /* ;;: split root if necessary (since it's special cased (2 allocs)) then call
-       _bt_insert2 on the root. split check and dirty check in _bt_insert2 will
-       both noop and insertion should proceed as normal */
-  return _bt_insert2(state, lo, hi, fo, root, 0);
+  size_t childidx = _bt_childidx(root, lo, hi);
+  BT_page *child = _node_get(state, root->datk[childidx].fo);
+  size_t N = _bt_node_nexthole(root);
+
+  /* if the root isn't dirty, cow it and flip the which */
+  if (!(meta->flags & BP_DIRTY)) {
+    BT_page *newroot;
+    pgno_t  newrootpg;
+
+    if (!SUCC(rc = _node_cow(state, root, &newroot, &newrootpg)))
+      return rc;
+
+    /* switch to other metapage and dirty it */
+    state->which = state->which ? 0 : 1;
+    meta = state->meta_pages[state->which];
+    meta->flags |= BP_DIRTY;
+    meta->root = newrootpg;
+    root = newroot;
+  }
+
+  /* CoW root's child if it isn't already dirty */
+  if (!_bt_ischilddirty(root, childidx)) {
+    BT_page *newchild;
+    pgno_t  newchildpg;
+    _node_cow(state, child, &newchild, &newchildpg);
+    root->datk[childidx].fo = newchildpg;
+    _bt_dirtychild(root, childidx);
+    child = newchild;
+  }
+
+  /* before calling into recursive insert, handle root splitting since it's
+     special cased (2 allocs) */
+  if (N >= BT_DAT_MAXKEYS - 1) {
+    pgno_t pg = 0;
+
+    /* the old root is now the left child of the new root */
+    BT_page *left = root;
+    BT_page *right = _node_alloc(state);
+    BT_page *rootnew = _node_alloc(state);
+
+    /* split root's data across left and right nodes */
+    _bt_split_datcopy(left, right);
+    /* save left and right in new root's .data */
+    pg = _fo_get(state, left);
+    rootnew->datk[0].fo = pg;
+    rootnew->datk[0].va = 0;
+    pg = _fo_get(state, right);
+    rootnew->datk[1].fo = pg;
+    rootnew->datk[1].va = right->datk[0].va;
+    rootnew->datk[2].va = UINT32_MAX;
+    /* dirty new root's children */
+    _bt_dirtychild(rootnew, 0);
+    _bt_dirtychild(rootnew, 1);
+    root = rootnew;
+    childidx = _bt_childidx(root, lo, hi);
+    child = _node_get(state, root->datk[childidx].fo);
+  }
+
+  /*
+    meta is dirty
+    root is dirty and split if necessary
+    root's child in insert path is dirty and split if necessary
+    finally, recurse on child
+  */
+  return _bt_insert2(state, lo, hi, fo, child, 1);
 }
 
 static int
