@@ -53,6 +53,9 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define TBYTES(x) ((size_t)(x) << 40)
 #define PBYTES(x) ((size_t)(x) << 50)
 
+/* 4K page in bytes */
+#define P2BYTES(x) ((size_t)(x) << 14)
+
 
 #define __packed        __attribute__((__packed__))
 #define UNUSED(x) ((void)(x))
@@ -71,6 +74,11 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 
 
 #define BT_MAPADDR  ((void*) S(0x2000,0000,0000))
+
+/* convert addr offset to raw address */
+#define OFF2ADDR(x) ((void *)((uintptr_t)(BT_MAPADDR) + (x)))
+/* convert raw memory address to offset */
+#define ADDR2OFF(a) ((vaof_t)((uintptr_t)(a) - (uintptr_t)BT_MAPADDR))
 
 #define BT_PAGEBITS 14ULL
 #define BT_PAGEWORD 32ULL
@@ -202,6 +210,22 @@ struct BT_meta {
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
 
+typedef struct BT_mlistnode BT_mlistnode;
+struct BT_mlistnode {
+  void *va;                     /* virtual address */
+  size_t sz;                    /* size in pages */
+  BT_mlistnode *next;           /* next freelist node */
+  /* ;;: make double linked */
+};
+
+typedef struct BT_flistnode BT_flistnode;
+struct BT_flistnode {
+  pgno_t pg;                    /* pgno - an offset in the persistent file */
+  size_t sz;                    /* size in pages */
+  BT_flistnode *next;           /* next freelist node */
+  /* ;;: make double linked */
+};
+
 /* macro to access the metadata stored in a page's data section */
 #define METADATA(p) ((BT_meta *)(void *)(p)->datc)
 
@@ -223,6 +247,8 @@ struct BT_state {
        every time it's referenced */
   /* BT_page      *root; */
   unsigned int  which;          /* which double-buffered db are we using? */
+  BT_mlistnode *mlist;          /* memory freelist */
+  BT_flistnode *flist;          /* pma file freelist */
 };
 
 
@@ -455,6 +481,7 @@ _bt_dirtychild(BT_page *parent, size_t child_idx)
 
 #define IS_ROOT(path) ((path)->depth == 0)
 
+/* ;:: assert that the node is dirty when splitting */
 static int
 _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
 {
@@ -489,12 +516,16 @@ _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
   return BT_SUCC;
 }
 
+/* ;;: since we won't be rebalancing on delete, but rather on insert, you should add rebalance logic to _bt_insert2 which checks the degree of a node and rebalances if less than minimum */
+
+static int
 _bt_rebalance(BT_state *state, BT_page *node)
 {
-
+  return 255;
 }
 
-/* ;;: since we won't be rebalancing on delete, but rather on insert, you should add rebalance logic to _bt_insert2 which checks the degree of a node and rebalances if less than minimum */
+/* ;;: todo, update meta->depth when we add a row. Should this be done in
+     _bt_rebalance? */
 
 
 static int
@@ -644,10 +675,153 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 }
 
 static int
-_bt_delete()
+_bt_delete(BT_state *state, vaof_t lo)
 {
 
   return 255;
+}
+
+static BT_mlistnode *
+_mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
+{
+  /* leaf */
+  if (depth == maxdepth) {
+    BT_mlistnode *head, *prev;
+    head = prev = calloc(1, sizeof(*head));
+
+    size_t i = 0;
+    BT_kv *kv = &node->datk[i];
+    while (i < BT_DAT_MAXKEYS - 1) {
+      /* free and contiguous with previous mlist node: merge */
+      if (kv->fo == 0
+          && ADDR2OFF(prev->va) + P2BYTES(prev->sz) == kv->va) {
+        vaof_t hi = node->datk[i+1].va;
+        vaof_t lo = kv->va;
+        size_t len = hi - lo;
+        prev->sz += len;
+      }
+      /* free but not contiguous with previous mlist node: append new node */
+      else if (kv->fo == 0) {
+        BT_mlistnode *new = calloc(1, sizeof(*new));
+        vaof_t hi = node->datk[i+1].va;
+        vaof_t lo = kv->va;
+        size_t len = hi - lo;
+        new->sz = len;
+        new->va = OFF2ADDR(lo);
+        prev->next = new;
+        prev = new;
+      }
+
+      kv = &node->datk[++i];
+    }
+    return head;
+  }
+
+  /* branch */
+  size_t i = 0;
+  BT_mlistnode *head, *prev;
+  head = prev = 0;
+  for (; i < BT_DAT_MAXKEYS; ++i) {
+    BT_kv kv = node->datk[i];
+    BT_page *child = _node_get(state, kv.fo);
+    BT_mlistnode *new = _mlist_create2(state, child, maxdepth, depth+1);
+    if (head == 0) {
+      head = prev = new;
+    }
+    else {
+      /* just blindly append and unify the ends afterward */
+      prev->next = new;
+    }
+  }
+  return 0;
+}
+
+static int
+_mlist_create(BT_state *state)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  uint8_t maxdepth = meta->depth;
+  BT_mlistnode *head = _mlist_create2(state, root, maxdepth, 0);
+
+  /*
+    trace the full freelist and unify nodes one last time
+    NB: linking the leaf nodes would make this unnecessary
+  */
+  BT_mlistnode *p = head;
+  BT_mlistnode *n = head->next;
+  while (n) {
+    size_t llen = P2BYTES(p->sz);
+    uintptr_t laddr = (uintptr_t)p->va;
+    uintptr_t raddr = (uintptr_t)n->va;
+    /* contiguous: unify */
+    if (laddr + llen == raddr) {
+      p->sz += n->sz;
+      p->next = n->next;
+      free(n);
+    }
+  }
+
+  state->mlist = head;
+  return BT_SUCC;
+}
+
+BT_flistnode *
+_flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
+{
+  /* leaf */
+  if (depth == maxdepth) {
+    BT_flistnode *head, *prev;
+    head = prev = calloc(1, sizeof(*head));
+
+    size_t i = 0;
+    BT_kv *kv = &node->datk[i];
+    while (i < BT_DAT_MAXKEYS - 1) {
+
+    }
+    return head;
+  }
+
+  /* branch */
+  size_t i = 0;
+  BT_flistnode *head, *prev;
+  head = prev = 0;
+  for (; i < BT_DAT_MAXKEYS; ++i) {
+    BT_kv kv = node->datk[i];
+    BT_page *child = _node_get(state, kv.fo);
+    BT_flistnode *new = _flist_create2(state, child, maxdepth, depth+1);
+    if (head == 0) {
+      head = prev = new;
+    }
+    else {
+      /* just blindly append and unify the ends afterward */
+      prev->next = new;
+    }
+  }
+  return 0;
+}
+
+static int
+_flist_create(BT_state *state)
+{
+  /* ;;: this one is trickier than _mlist_create since entries in the btree are
+     not sorted by file offset
+
+     one option: just append a bunch of nodes, sort the list, and merge those
+     with contiguous regions
+  */
+
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  uint8_t maxdepth = meta->depth;
+  BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
+
+  /* sort */
+
+  /* merge contiguous regions */
+
+  state->flist = head;
+  return BT_SUCC;
 }
 
 #define CLOSE_FD(fd)                            \
@@ -768,6 +942,14 @@ _bt_state_load(BT_state *state)
   return BT_SUCC;
 }
 
+static pgno_t
+_bt_falloc(BT_state *state, size_t pages)
+{
+  /* walk the persistent file freelist and return a pgno with sufficient
+     contiguous space for pages */
+  return 0;
+}
+
 
 //// ===========================================================================
 ////                            btree external routines
@@ -831,10 +1013,43 @@ bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
   return rc;
 }
 
+void *
+bt_malloc(BT_state *state, size_t pages)
+{
+  BT_mlistnode **n = &state->mlist;
+  /* first fit */
+  for (; *n; n = &(*n)->next) {
+    /* perfect fit */
+    if ((*n)->sz == pages) {
+      void *ret = (*n)->va;
+      *n = (*n)->next;
+      return ret;
+    }
+    /* larger than necessary: shrink the node */
+    if ((*n)->sz > pages) {
+      void *ret = (*n)->va;
+      pgno_t pgno = _bt_falloc(state, pages);
+      bp(pgno != 0);
+      _bt_insert(state,
+                 ADDR2OFF((*n)->va),
+                 ADDR2OFF((*n)->va) + P2BYTES(pages),
+                 pgno);
+      (*n)->sz -= pages;
+      (*n)->va = (BT_page *)(*n)->va + pages;
+      return ret;
+    }
+  }
+
+  bp(0);
+  return 0;
+}
+
 int main(int argc, char *argv[])
 {
   BT_state *state;
   bt_state_new(&state);
   bt_state_open(state, "./pmatest", 0, 644);
+  _mlist_create(state);
+  _flist_create(state);
   return 0;
 }
