@@ -251,8 +251,6 @@ _node_get(BT_state *state, pgno_t pgno)
   - sector that contains node is i-1
   - appropriately offset into i-1th fixed size partition: 2M, 8M, 16M, ...
 
-
-
   */
 
   /* for now, this works because the 2M sector is at the beginning of both the
@@ -395,10 +393,10 @@ _bt_findpath_is_root(BT_findpath *path)
   return path->depth == 0;
 }
 
-/* _bt_node_nexthole: find next empty space in node's data section. Returned as
+/* _bt_numkeys: find next empty space in node's data section. Returned as
    index into node->datk. If the node is full, return is BT_DAT_MAXKEYS */
 static size_t
-_bt_node_nexthole(BT_page *node)
+_bt_numkeys(BT_page *node)
 {
   size_t i = 1;
   for (; i < BT_DAT_MAXKEYS; i++) {
@@ -433,19 +431,26 @@ _bt_split_datcopy(BT_page *left, BT_page *right)
   return BT_SUCC;
 }
 
-/* ;;: todo, fix these */
-static int
-_bt_dirtychild(BT_page *parent, size_t child_idx)
-{
-  child_idx >>= sizeof(parent->head.dirty[0]);
-  parent->head.dirty[child_idx] |= 1;
-  return BT_SUCC;
-}
 static int
 _bt_ischilddirty(BT_page *parent, size_t child_idx)
 {
-  uint8_t flag = parent->head.dirty[child_idx >> 4];
-  return (flag << 4) & child_idx;
+  assert(child_idx < 2048);
+  uint8_t flag = parent->head.dirty[child_idx >> 3];
+  return flag & (1 << (child_idx & 0x7));
+}
+
+/* ;;: todo: name the 0x8 and 4 literals and/or generalize */
+static int
+_bt_dirtychild(BT_page *parent, size_t child_idx)
+{
+  assert(child_idx < 2048);
+  /* although there's nothing theoretically wrong with dirtying a dirty node,
+     there's probably a bug if we do it since a we only dirty a node when it's
+     alloced after a split or CoWed */
+  assert(!_bt_ischilddirty(parent, child_idx));
+  uint8_t *flag = &parent->head.dirty[child_idx >> 3];
+  *flag |= 1 << (child_idx & 0x7);
+  return BT_SUCC;
 }
 
 #define IS_ROOT(path) ((path)->depth == 0)
@@ -484,6 +489,13 @@ _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
   return BT_SUCC;
 }
 
+_bt_rebalance(BT_state *state, BT_page *node)
+{
+
+}
+
+/* ;;: since we won't be rebalancing on delete, but rather on insert, you should add rebalance logic to _bt_insert2 which checks the degree of a node and rebalances if less than minimum */
+
 
 static int
 _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
@@ -506,7 +518,7 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
   assert(depth > 0);            /* routine doesn't handle root splitting */
 
   int rc = 255;
-  size_t N = _bt_node_nexthole(node);
+  size_t N = _bt_numkeys(node);
   size_t childidx = _bt_childidx(node, lo, hi);
   BT_meta *meta = state->meta_pages[state->which];
 
@@ -566,7 +578,7 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
   BT_page *root = _node_get(state, meta->root);
   size_t childidx = _bt_childidx(root, lo, hi);
   BT_page *child = _node_get(state, root->datk[childidx].fo);
-  size_t N = _bt_node_nexthole(root);
+  size_t N = _bt_numkeys(root);
 
   /* if the root isn't dirty, cow it and flip the which */
   if (!(meta->flags & BP_DIRTY)) {
@@ -634,6 +646,7 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 static int
 _bt_delete()
 {
+
   return 255;
 }
 
