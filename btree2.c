@@ -55,6 +55,8 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 
 /* 4K page in bytes */
 #define P2BYTES(x) ((size_t)(x) << 14)
+/* the opposite of P2BYTES */
+#define B2PAGES(x) ((size_t)(x) >> 14)
 
 
 #define __packed        __attribute__((__packed__))
@@ -436,9 +438,10 @@ _bt_datshift(BT_page *node, size_t i, size_t n)
 /* shift data segment at i over by n KVs */
 {
   assert(i+n < BT_DAT_MAXKEYS); /* check buffer overflow */
-  size_t bytelen = (BT_DAT_MAXKEYS - i) * sizeof(node->datk[0]);
+  size_t siz = sizeof node->datk[0];
+  size_t bytelen = (BT_DAT_MAXKEYS - i) * siz;
   memmove(&node->datk[i+n], &node->datk[i], bytelen);
-  ZERO(&node->datk[i], n * sizeof(node->datk[0]));
+  ZERO(&node->datk[i], n * siz);
   return BT_SUCC;
 }
 
@@ -524,10 +527,49 @@ _bt_rebalance(BT_state *state, BT_page *node)
   return 255;
 }
 
+/* insert lo, hi, and fo in parent's data section for childidx */
+static int
+_bt_insertdat(vaof_t lo, vaof_t hi, pgno_t fo,
+              BT_page *parent, size_t childidx)
+{
+  /* ;;: TODO confirm this logic is appropriate for branch nodes. (It /should/
+       be correct for leaf nodes) */
+  vaof_t llo = parent->datk[childidx].va;
+  vaof_t hhi = parent->datk[childidx+1].va;
+
+  /* duplicate */
+  if (llo == lo && hhi == hi) {
+    parent->datk[childidx].fo = fo;
+    return BT_SUCC;
+  }
+
+  if (llo == lo) {
+    _bt_datshift(parent, childidx, 1);
+    vaof_t oldfo = parent->datk[childidx].fo;
+    parent->datk[childidx].fo = fo;
+    parent->datk[childidx+1].va = hi;
+    parent->datk[childidx+1].fo = oldfo + (hi - llo);
+  }
+  else if (hhi == hi) {
+    _bt_datshift(parent, childidx, 1);
+    parent->datk[childidx+1].va = lo;
+    parent->datk[childidx+1].fo = fo;
+  }
+  else {
+    _bt_datshift(parent, childidx, 2);
+    parent->datk[childidx+1].va = lo;
+    parent->datk[childidx+1].fo = fo;
+    parent->datk[childidx+2].va = hi;
+    pgno_t lfo = parent->datk[childidx].fo;
+    vaof_t lva = parent->datk[childidx].va;
+    parent->datk[childidx+2].fo = lfo + (hi - lva);
+  }
+
+  return BT_SUCC;
+}
+
 /* ;;: todo, update meta->depth when we add a row. Should this be done in
      _bt_rebalance? */
-
-
 static int
 _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
         BT_page *node, size_t depth)
@@ -551,19 +593,13 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
   int rc = 255;
   size_t N = _bt_numkeys(node);
   size_t childidx = _bt_childidx(node, lo, hi);
+  assert(childidx != BT_DAT_MAXKEYS);
   BT_meta *meta = state->meta_pages[state->which];
 
   /* nullcond: node is a leaf */
   if (meta->depth == depth) {
     /* guaranteed non-full and dirty by n-1 recursive call, so just insert */
-
-    /* ;;: fixme the logic is more complex. Need to unify left and right
-         entries with childidx */
-    _bt_datshift(node, childidx, 1);
-    node->datk[childidx].va = lo;
-    node->datk[childidx].fo = fo;
-
-    return BT_SUCC;
+    return _bt_insertdat(lo, hi, fo, node, childidx);
   }
 
   /* do we need to CoW the child node? */
@@ -571,16 +607,25 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
     BT_page *newchild;
     pgno_t pgno;
     _node_cow(state, node, &newchild, &pgno);
-    /* ;;: fixme, further insert logic necessary obv -- wait, is it? */
     node->datk[childidx].fo = pgno;
     _bt_dirtychild(node, childidx);
   }
 
   /* do we need to split the child node? */
-  if (N >= BT_DAT_MAXKEYS - 1) {
+  if (N >= BT_DAT_MAXKEYS - 2) {
       pgno_t rchild_pgno;
       if (!SUCC(rc = _bt_split_child(state, node, childidx, &rchild_pgno)))
         return rc;
+
+      
+      /* ;;: FIX FIX FIX FIX FIX { */
+
+      /* since we split the child's data, recalculate the child idx */
+      /* ;;: note, this can be simplified into a conditional i++ */
+      childidx = _bt_childidx(node, lo, hi);
+      _bt_insertdat(lo, hi, rchild_pgno, node, childidx);
+
+
       /* now insert the new child into parent... */
       /* ;;: may need to be fixed */
       _bt_datshift(node, childidx, 1);
@@ -592,6 +637,8 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
       /* since we split the child's data, recalculate the child idx */
       /* ;;: note, this can be simplified into a conditional i++ */
       childidx = _bt_childidx(node, lo, hi);
+
+      /* } */
   }
 
   /* the child is now guaranteed non-full (split) and dirty. Recurse */
@@ -639,7 +686,7 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 
   /* before calling into recursive insert, handle root splitting since it's
      special cased (2 allocs) */
-  if (N >= BT_DAT_MAXKEYS - 1) {
+  if (N >= BT_DAT_MAXKEYS - 2) { /* ;;: remind, fix all these conditions to be - 2 */
     pgno_t pg = 0;
 
     /* the old root is now the left child of the new root */
@@ -687,7 +734,7 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
   /* leaf */
   if (depth == maxdepth) {
     BT_mlistnode *head, *prev;
-    head = prev = calloc(1, sizeof(*head));
+    head = prev = calloc(1, sizeof *head);
 
     size_t i = 0;
     BT_kv *kv = &node->datk[i];
@@ -697,15 +744,15 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
           && ADDR2OFF(prev->va) + P2BYTES(prev->sz) == kv->va) {
         vaof_t hi = node->datk[i+1].va;
         vaof_t lo = kv->va;
-        size_t len = hi - lo;
+        size_t len = B2PAGES(hi - lo);
         prev->sz += len;
       }
       /* free but not contiguous with previous mlist node: append new node */
       else if (kv->fo == 0) {
-        BT_mlistnode *new = calloc(1, sizeof(*new));
+        BT_mlistnode *new = calloc(1, sizeof *new);
         vaof_t hi = node->datk[i+1].va;
         vaof_t lo = kv->va;
-        size_t len = hi - lo;
+        size_t len = B2PAGES(hi - lo);
         new->sz = len;
         new->va = OFF2ADDR(lo);
         prev->next = new;
@@ -774,10 +821,22 @@ _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
     BT_flistnode *head, *prev;
     head = prev = calloc(1, sizeof(*head));
 
+    /* ;;: fixme the head won't get populated in this logic */
     size_t i = 0;
     BT_kv *kv = &node->datk[i];
     while (i < BT_DAT_MAXKEYS - 1) {
+      /* Just blindly append nodes since they aren't guaranteed sorted */
+      BT_flistnode *new = calloc(1, sizeof *new);
+      vaof_t hi = node->datk[i+1].va;
+      vaof_t lo = kv->va;
+      size_t len = B2PAGES(hi - lo);
+      pgno_t fo = kv->fo;
+      new->sz = len;
+      new->pg = fo;
+      prev->next = new;
+      prev = new;
 
+      kv = &node->datk[++i];
     }
     return head;
   }
@@ -816,9 +875,22 @@ _flist_create(BT_state *state)
   uint8_t maxdepth = meta->depth;
   BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
 
-  /* sort */
+  /* sort the freelist */
 
-  /* merge contiguous regions */
+  /* merge contiguous regions after sorting */
+  BT_flistnode *p = head;
+  BT_flistnode *n = head->next;
+  while (n) {
+    size_t llen = p->sz;
+    pgno_t lfo = p->pg;
+    pgno_t rfo = n->pg;
+    /* contiguous: unify */
+    if (lfo + llen == rfo) {
+      p->sz += n->sz;
+      p->next = n->next;
+      free(n);
+    }
+  }
 
   state->flist = head;
   return BT_SUCC;
