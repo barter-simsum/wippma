@@ -217,7 +217,6 @@ struct BT_mlistnode {
   void *va;                     /* virtual address */
   size_t sz;                    /* size in pages */
   BT_mlistnode *next;           /* next freelist node */
-  /* ;;: make double linked */
 };
 
 typedef struct BT_flistnode BT_flistnode;
@@ -225,7 +224,6 @@ struct BT_flistnode {
   pgno_t pg;                    /* pgno - an offset in the persistent file */
   size_t sz;                    /* size in pages */
   BT_flistnode *next;           /* next freelist node */
-  /* ;;: make double linked */
 };
 
 /* macro to access the metadata stored in a page's data section */
@@ -813,6 +811,100 @@ _mlist_create(BT_state *state)
   return BT_SUCC;
 }
 
+static void
+_flist_split(BT_flistnode *head, BT_flistnode **left, BT_flistnode **right)
+/* split flist starting at head into two lists, left and right at the midpoint
+   of head */
+{
+  assert(head != 0);
+  BT_flistnode *slow, *fast;
+  slow = head; fast = head->next;
+
+  while (fast) {
+    fast = fast->next;
+    if (fast) {
+      slow = slow->next;
+      fast = fast->next;
+    }
+  }
+
+  *left = head;
+  *right = slow->next;
+  slow->next = 0;
+}
+
+static BT_flistnode *
+_flist_merge2(BT_flistnode *l, BT_flistnode *r)
+/* returns the furthest node in l that has a pg less than the first node in r */
+{
+  assert(l);
+  assert(r);
+
+  BT_flistnode *curr, *prev;
+  prev = l;
+  curr = l->next;
+
+  while (curr) {
+    if (curr->pg < r->pg) {
+      prev = curr;
+      curr = curr->next;
+    }
+  }
+
+  if (prev->pg < r->pg)
+    return prev;
+
+  return 0;
+}
+
+static BT_flistnode *
+_flist_merge(BT_flistnode *l, BT_flistnode *r)
+/* merge two sorted flists, l and r and return the sorted result */
+{
+  BT_flistnode *head;
+
+  if (!l) return r;
+  if (!r) return l;
+
+  while (l && r) {
+    if (l->next == 0) {
+      l->next = r;
+      break;
+    }
+    if (r->next == 0) {
+      break;
+    }
+
+    BT_flistnode *ll = _flist_merge2(l, r);
+    BT_flistnode *rnext = r->next;
+    /* insert head of r into appropriate spot in l */
+    r->next = ll->next;
+    ll->next = r;
+    /* adjust l and r heads */
+    l = ll->next;
+    r = rnext;
+  }
+
+  return head;
+}
+
+BT_flistnode *
+_flist_mergesort(BT_flistnode *head)
+{
+  if (head == 0 || head->next == 0)
+    return head;
+
+  BT_flistnode *l, *r;
+  _flist_split(head, &l, &r);
+
+  /* ;;: todo, make it non-recursive. Though, shouldn't matter as much here
+       since O(log n). merge already non-recursive */
+  _flist_mergesort(l);
+  _flist_mergesort(r);
+
+  return _flist_merge(l, r);
+}
+
 BT_flistnode *
 _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 {
@@ -876,6 +968,7 @@ _flist_create(BT_state *state)
   BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
 
   /* sort the freelist */
+  _flist_mergesort(head);
 
   /* merge contiguous regions after sorting */
   BT_flistnode *p = head;
@@ -1014,11 +1107,40 @@ _bt_state_load(BT_state *state)
   return BT_SUCC;
 }
 
+/* ;;: TODO, when persistence has been implemented, _bt_falloc will probably
+     need to handle extension of the file with appropriate striping. i.e. if no
+     space is found on the freelist, save the last entry, expand the file size,
+     and set last_entry->next to a new node representing the newly added file
+     space */
 static pgno_t
 _bt_falloc(BT_state *state, size_t pages)
 {
   /* walk the persistent file freelist and return a pgno with sufficient
      contiguous space for pages */
+  BT_flistnode **n = &state->flist;
+  pgno_t ret = 0;
+
+  /* first fit */
+  /* ;;: is there any reason to use a different allocation strategy for disk? */
+  for (; *n; n = &(*n)->next) {
+    /* perfect fit */
+    if ((*n)->sz == pages) {
+      pgno_t ret;
+      ret = (*n)->pg;
+      *n = (*n)->next;
+      return ret;
+    }
+    /* larger than necessary: shrink the node */
+    if ((*n)->sz > pages) {
+      pgno_t ret;
+      ret = (*n)->pg;
+      (*n)->sz -= pages;
+      (*n)->pg = (*n)->pg + pages;
+      return ret;
+    }
+  }
+
+  bp(0);                        /* ;;: tmp dbg. no space found */
   return 0;
 }
 
@@ -1089,31 +1211,33 @@ void *
 bt_malloc(BT_state *state, size_t pages)
 {
   BT_mlistnode **n = &state->mlist;
+  void *ret = 0;
   /* first fit */
   for (; *n; n = &(*n)->next) {
     /* perfect fit */
     if ((*n)->sz == pages) {
-      void *ret = (*n)->va;
+      ret = (*n)->va;
       *n = (*n)->next;
-      return ret;
+      break;
     }
     /* larger than necessary: shrink the node */
     if ((*n)->sz > pages) {
-      void *ret = (*n)->va;
-      pgno_t pgno = _bt_falloc(state, pages);
-      bp(pgno != 0);
-      _bt_insert(state,
-                 ADDR2OFF((*n)->va),
-                 ADDR2OFF((*n)->va) + P2BYTES(pages),
-                 pgno);
+      ret = (*n)->va;
       (*n)->sz -= pages;
       (*n)->va = (BT_page *)(*n)->va + pages;
-      return ret;
+      break;
     }
   }
 
-  bp(0);
-  return 0;
+  pgno_t pgno = _bt_falloc(state, pages);
+  bp(pgno != 0);
+  _bt_insert(state,
+             ADDR2OFF(ret),
+             ADDR2OFF(ret) + P2BYTES(pages),
+             pgno);
+
+  bp(ret != 0);
+  return ret;
 }
 
 int main(int argc, char *argv[])
