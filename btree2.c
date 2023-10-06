@@ -37,6 +37,10 @@ typedef unsigned long ULONG;
 STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #endif
 
+/* coalescing of memory freelist currently prohibited since we haven't
+   implemented coalescing of btree nodes (necessary) */
+#define CAN_COALESCE 0
+
 #define ZERO(s, n) memset((s), 0, (n))
 
 #define S7(A, B, C, D, E, F, G) A##B##C##D##E##F##G
@@ -212,6 +216,13 @@ struct BT_meta {
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
 
+typedef struct BT_nlistnode BT_nlistnode;
+struct BT_nlistnode {
+  pgno_t pg;
+  size_t sz;
+  BT_nlistnode *next;
+};
+
 typedef struct BT_mlistnode BT_mlistnode;
 struct BT_mlistnode {
   void *va;                     /* virtual address */
@@ -247,6 +258,7 @@ struct BT_state {
        every time it's referenced */
   /* BT_page      *root; */
   unsigned int  which;          /* which double-buffered db are we using? */
+  BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
   BT_flistnode *flist;          /* pma file freelist */
 };
@@ -310,6 +322,13 @@ _node_alloc(BT_state *state)
   assert(width < MBYTES(2));
   /* ;;: todo confirm data sections are zeroed */
   return state->node_freelist++;
+}
+
+static BT_page *
+__node_alloc(BT_state *state)
+{
+  /* TODO implement node freelist rather than a bump pointer */
+  return 0;
 }
 
 static int
@@ -646,10 +665,11 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
 
 static int
 _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
+/* handles CoWing/splitting of the root page since it's special cased. Then
+   passes the child matching hi/lo to _bt_insert2 */
 {
   int rc;
 
-  /* ;;: handle separately the root, then pass to _bt_insert2 */
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   size_t childidx = _bt_childidx(root, lo, hi);
@@ -719,11 +739,28 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
   return _bt_insert2(state, lo, hi, fo, child, 1);
 }
 
-static int
-_bt_delete(BT_state *state, vaof_t lo)
-{
+/* ;;: wip */
+/* ;;: inspired by lmdb's MDB_pageparent. While seemingly unnecessary for
+     _bt_insert, this may be useful for _bt_delete */
+typedef struct BT_ppage BT_ppage;
+struct BT_ppage {
+  BT_page *node;
+  BT_page *parent;
+};
 
-  return 255;
+/* static int */
+/* _bt_ppage_get(BT_state *state, size_t childidx, BT_ppage **bpp) */
+/* { */
+/*   BT_page *child = _node_get(state, pgno); */
+/*   (*bpp)->node = child; */
+/* } */
+
+static int
+_bt_delete(BT_state *state, vaof_t lo, vaof_t hi)
+{
+  /* ;;: tmp, implement coalescing of zero ranges and merging/rebalancing of
+       nodes */
+  return _bt_insert(state, lo, hi, 0);
 }
 
 static BT_mlistnode *
@@ -737,6 +774,7 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
     size_t i = 0;
     BT_kv *kv = &node->datk[i];
     while (i < BT_DAT_MAXKEYS - 1) {
+#if CAN_COALESCE
       /* free and contiguous with previous mlist node: merge */
       if (kv->fo == 0
           && ADDR2OFF(prev->va) + P2BYTES(prev->sz) == kv->va) {
@@ -747,6 +785,7 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
       }
       /* free but not contiguous with previous mlist node: append new node */
       else if (kv->fo == 0) {
+#endif
         BT_mlistnode *new = calloc(1, sizeof *new);
         vaof_t hi = node->datk[i+1].va;
         vaof_t lo = kv->va;
@@ -755,7 +794,9 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
         new->va = OFF2ADDR(lo);
         prev->next = new;
         prev = new;
+#if CAN_COALESCE
       }
+#endif
 
       kv = &node->datk[++i];
     }
@@ -793,6 +834,7 @@ _mlist_create(BT_state *state)
     trace the full freelist and unify nodes one last time
     NB: linking the leaf nodes would make this unnecessary
   */
+#if CAN_COALESCE
   BT_mlistnode *p = head;
   BT_mlistnode *n = head->next;
   while (n) {
@@ -806,6 +848,7 @@ _mlist_create(BT_state *state)
       free(n);
     }
   }
+#endif
 
   state->mlist = head;
   return BT_SUCC;
@@ -955,13 +998,6 @@ _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 static int
 _flist_create(BT_state *state)
 {
-  /* ;;: this one is trickier than _mlist_create since entries in the btree are
-     not sorted by file offset
-
-     one option: just append a bunch of nodes, sort the list, and merge those
-     with contiguous regions
-  */
-
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
@@ -1240,12 +1276,159 @@ bt_malloc(BT_state *state, size_t pages)
   return ret;
 }
 
+
+//// ===========================================================================
+////                                    tests
+
+/* ;;: obv this should be moved to a separate file */
+static void
+_sham_sync_clean(BT_page *node)
+{
+  for (uint8_t *dit = &node->head.dirty[0]
+         ; dit < &node->head.dirty[sizeof(node->head.dirty) - 1]
+         ; dit++) {
+    *dit = 0;
+  }
+}
+
+static void
+_sham_sync2(BT_state *state, BT_page *node, uint8_t depth, uint8_t maxdepth)
+{
+  if (depth == maxdepth) return;
+
+  /* clean node */
+  _sham_sync_clean(node);
+
+  /* then recurse and clean all children with DFS */
+  size_t N = _bt_numkeys(node);
+  for (size_t i = 1; i < N; ++i) {
+    BT_kv kv = node->datk[i];
+    pgno_t childpg = kv.fo;
+    BT_page *child = _node_get(state, childpg);
+    _sham_sync2(state, child, depth++, maxdepth);
+  }
+}
+
+static void
+_sham_sync(BT_state *state)
+{
+  /* walk the tree and unset the dirty bit from all pages */
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  meta->flags ^= BP_DIRTY;      /* unset the meta dirty flag */
+  _sham_sync2(state, root, 0, meta->depth);
+}
+
+static void
+_test_nodeinteg(BT_state *state, BT_findpath *path,
+                vaof_t lo, vaof_t hi, pgno_t pg)
+{
+  size_t childidx = 0;
+  BT_page *parent = 0;
+
+  assert(SUCC(_bt_find(state, path, lo, hi)));
+  parent = path->path[path->depth];
+  childidx = path->idx[path->depth];
+  assert(parent->datk[childidx].fo == pg);
+  assert(parent->datk[childidx].va == lo);
+  assert(parent->datk[childidx+1].va == hi);
+}
+
 int main(int argc, char *argv[])
 {
   BT_state *state;
+  BT_findpath path = {0};
+
   bt_state_new(&state);
   bt_state_open(state, "./pmatest", 0, 644);
   _mlist_create(state);
   _flist_create(state);
+
+  /* ;;: haven't implemented bt_state_close yet - though it shouldn't be
+     terribly hard, so should just run these tests independently by commenting
+     them out for now */
+
+  
+  //// ===========================================================================
+  ////                                    test1
+
+  /* splitting tests. Insert sufficient data to force splitting. breakpoint before
+     that split is performed */
+
+  /* the hhi == hi case for more predictable splitting math */
+  vaof_t lo = 10;
+  vaof_t hi = BT_DAT_MAXKEYS * 4;
+  pgno_t pg = 1;                /* dummy value */
+  for (size_t i = 0; i < BT_DAT_MAXKEYS * 4; ++i) {
+    if (i % (BT_DAT_MAXKEYS - 2) == 0)
+      bp(0);                    /* breakpoint on split case */
+    _bt_insert(state, lo, hi, pg);
+    _test_nodeinteg(state, &path, lo++, hi, pg++);
+  }
+
+  int which = state->which;
+  /* sham sync and re-run insertions */
+  _sham_sync(state);
+  for (size_t i = 0; i < BT_DAT_MAXKEYS * 4; ++i) {
+    _bt_insert(state, lo, hi, pg);
+    _test_nodeinteg(state, &path, lo++, hi, pg++);
+  }
+  assert(which != state->which);
+
+
+  
+  //// ===========================================================================
+  ////                                    test2
+
+  /* varieties of insert */
+
+  /* 2.1 exact match */
+  lo = 0x10;
+  hi = 0x20;
+  pg = 0xFFFFFFFF;
+
+  bp(0);
+  _bt_insert(state, lo, hi, pg);
+  _bt_insert(state, lo, hi, pg);
+
+  /* ;;: you should also probably assert the data is laid out in datk at you expect */
+  _test_nodeinteg(state, &path, lo, hi, pg);
+
+  _bt_delete(state, lo, hi);
+
+  /* 2.2 neither bounds match */
+  bp(0);
+  _bt_insert(state, lo, hi, pg);
+  _bt_insert(state, lo+2, hi-2, pg-1);
+
+  _test_nodeinteg(state, &path, lo, hi, pg);
+  _test_nodeinteg(state, &path, lo+2, hi-2, pg-1);
+
+  _bt_delete(state, lo, hi);
+  _bt_delete(state, lo+2, hi-2);
+
+  /* 2.3 space to right */
+  bp(0);
+  _bt_insert(state, lo, hi, pg);
+  _bt_insert(state, lo, hi-2, pg-1);
+
+  _test_nodeinteg(state, &path, lo, hi, pg);
+  _test_nodeinteg(state, &path, lo, hi-2, pg-1);
+
+  _bt_delete(state, lo, hi);
+  _bt_delete(state, lo, hi-2);
+
+  /* 2.4 space to left */
+  bp(0);
+
+  _bt_insert(state, lo, hi, pg);
+  _bt_insert(state, lo+2, hi, pg-1);
+
+  _test_nodeinteg(state, &path, lo, hi, pg);
+  _test_nodeinteg(state, &path, lo+2, hi, pg-1);
+
+  _bt_delete(state, lo, hi);
+  _bt_delete(state, lo+2, hi);
+
   return 0;
 }
