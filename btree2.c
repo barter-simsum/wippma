@@ -79,7 +79,10 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define SUCC(x) ((x) == BT_SUCC)
 
 
-#define BT_MAPADDR  ((void*) S(0x2000,0000,0000))
+/* ;;: getting a SIGBUS when attempting to map at the 0x2000,0000,0000
+   addr. Mapping at 0x1,0000 for now */
+#define BT_MAPADDR  ((void *) S(0x2000,0000,0000))
+#define BT_MAPADDR  ((void *) 0x10000)
 
 /* convert addr offset to raw address */
 #define OFF2ADDR(x) ((void *)((uintptr_t)(BT_MAPADDR) + (x)))
@@ -854,6 +857,20 @@ _mlist_create(BT_state *state)
   return BT_SUCC;
 }
 
+static int
+_mlist_delete(BT_state *state)
+{
+  BT_mlistnode *head, *prev;
+  head = prev = state->mlist;
+  while (head->next) {
+    prev = head;
+    head = head->next;
+    free(prev);
+  }
+  state->mlist = 0;
+  return BT_SUCC;
+}
+
 static void
 _flist_split(BT_flistnode *head, BT_flistnode **left, BT_flistnode **right)
 /* split flist starting at head into two lists, left and right at the midpoint
@@ -1025,6 +1042,20 @@ _flist_create(BT_state *state)
   return BT_SUCC;
 }
 
+static int
+_flist_delete(BT_state *state)
+{
+  BT_flistnode *head, *prev;
+  head = prev = state->flist;
+  while (head->next) {
+    prev = head;
+    head = head->next;
+    free(prev);
+  }
+  state->flist = 0;
+  return BT_SUCC;
+}
+
 #define CLOSE_FD(fd)                            \
   do {                                          \
     close(fd);                                  \
@@ -1117,7 +1148,7 @@ _bt_state_load(BT_state *state)
 
   state->map = mmap(BT_MAPADDR,
                     BT_ADDRSIZE,
-                    PROT_READ,
+                    PROT_READ | PROT_WRITE,
                     MAP_FIXED | MAP_SHARED,
                     state->data_fd,
                     0);
@@ -1217,7 +1248,10 @@ bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
   if (!dpath) return ENOMEM;
   sprintf(dpath, "%s" DATANAME, path);
 
-  if ((state->data_fd = open(path, oflags, mode)) == -1)
+  if (mkdir(path, 0774) == -1)
+    return errno;
+
+  if ((state->data_fd = open(dpath, oflags, mode)) == -1)
     return errno;
 
   if (!SUCC(rc = _bt_state_load(state)))
@@ -1241,6 +1275,23 @@ bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
 
   free(dpath);
   return rc;
+}
+
+int
+bt_state_close(BT_state *state)
+{
+  int rc;
+  if (state->data_fd != -1) CLOSE_FD(state->data_fd);
+  if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
+
+  /* ;;: wip delete the file because we haven't implemented persistence yet */
+  if (!SUCC(rc = remove(state->path)))
+    return rc;
+
+  _mlist_delete(state);
+  _flist_delete(state);
+
+  return BT_SUCC;
 }
 
 void *
@@ -1340,7 +1391,7 @@ int main(int argc, char *argv[])
   BT_findpath path = {0};
 
   bt_state_new(&state);
-  bt_state_open(state, "./pmatest", 0, 644);
+  bt_state_open(state, "./pmatest", 0, 0644);
   _mlist_create(state);
   _flist_create(state);
 
@@ -1375,10 +1426,16 @@ int main(int argc, char *argv[])
   }
   assert(which != state->which);
 
+  bt_state_close(state);
+
 
   
   //// ===========================================================================
   ////                                    test2
+
+  bt_state_open(state, "./pmatest", 0, 644);
+  _mlist_create(state);
+  _flist_create(state);
 
   /* varieties of insert */
 
@@ -1429,6 +1486,8 @@ int main(int argc, char *argv[])
 
   _bt_delete(state, lo, hi);
   _bt_delete(state, lo+2, hi);
+
+  bt_state_close(state);
 
   return 0;
 }
