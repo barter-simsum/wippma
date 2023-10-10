@@ -79,10 +79,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define SUCC(x) ((x) == BT_SUCC)
 
 
-/* ;;: getting a SIGBUS when attempting to map at the 0x2000,0000,0000
-   addr. Mapping at 0x1,0000 for now */
-#define BT_MAPADDR  ((void *) S(0x2000,0000,0000))
-#define BT_MAPADDR  ((void *) 0x10000)
+#define BT_MAPADDR  ((void *) S(0x1000,0000,0000))
 
 /* convert addr offset to raw address */
 #define OFF2ADDR(x) ((void *)((uintptr_t)(BT_MAPADDR) + (x)))
@@ -93,6 +90,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_PAGEWORD 32ULL
 #define BT_PAGESIZE (1ULL << BT_PAGEBITS) /* 16K */
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
+
 /*
   FO2BY: file offset to byte
   get byte INDEX into pma map from file offset
@@ -413,16 +411,13 @@ _bt_find2(BT_state *state,
   }
 }
 
-BT_page *
-_bt_root_new(BT_state *state)
+static void
+_bt_root_new(BT_page *root)
 {
-  BT_page *root = _node_alloc(state);
-  state->meta_pages[state->which]->root = _fo_get(state, root);
   root->datk[0].va = 0;
   root->datk[0].fo = 0;
   root->datk[1].va = UINT32_MAX;
   root->datk[1].fo = 0;
-  return root;
 }
 
 static int
@@ -1020,6 +1015,9 @@ _flist_create(BT_state *state)
   uint8_t maxdepth = meta->depth;
   BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
 
+  if (head == 0)
+    return BT_SUCC;
+
   /* sort the freelist */
   _flist_mergesort(head);
 
@@ -1084,42 +1082,53 @@ _bt_state_read_header(BT_state *state, BT_meta *meta)
 }
 
 static int
-_bt_state_meta_new(BT_state *state, BT_meta *meta)
+_bt_state_meta_new(BT_state *state)
+#define INITIAL_ROOTPG 2
 {
-  BT_page *p1, *p2;
+  BT_page *p1, *p2, *root;
+  BT_meta meta = {0};
   int rc, pagesize;
 
   TRACE();
 
-  pagesize = sizeof *p1 * 2;
+  root = &((BT_page *)state->map)[INITIAL_ROOTPG];
+  _bt_root_new(root);
+
+  pagesize = sizeof *p1;
 
   /* initialize meta struct */
-  meta->magic = BT_MAGIC;
-  meta->version = BT_VERSION;
-  meta->last_pg = 1;
-  meta->txnid = 0;
-  meta->fix_addr = BT_MAPADDR;
-  meta->blk_cnt = 1;
-  meta->depth = 1;
-  meta->flags = BP_META;
-  meta->root = UINT32_MAX;      /* ;;: actually should probably be 0 */
+  meta.magic = BT_MAGIC;
+  meta.version = BT_VERSION;
+  meta.last_pg = 1;
+  meta.txnid = 0;
+  meta.fix_addr = BT_MAPADDR;
+  meta.blk_cnt = 1;
+  meta.depth = 1;
+  meta.flags = BP_META;
+  /* meta.root = UINT32_MAX;      /\* ;;: actually should probably be 0 *\/ */
+  meta.root = INITIAL_ROOTPG;
 
   /* initialize the metapages */
-  p1 = calloc(2, BT_PAGESIZE);
-  p2 = p1 + 1;
+  p1 = &((BT_page *)state->map)[0];
+  p2 = &((BT_page *)state->map)[1];
+  /* p1 = calloc(2, BT_PAGESIZE); */
+  /* p2 = p1 + 1; */
 
   /* copy the metadata into the metapages */
-  memcpy(METADATA(p1), meta, sizeof *meta);
-  memcpy(METADATA(p2), meta, sizeof *meta);
+  memcpy(METADATA(p1), &meta, sizeof meta);
+  /* ;;: todo, should the second metapage actually share a .root with the
+       first?? */
+  memcpy(METADATA(p2), &meta, sizeof meta);
 
   /* sync new meta pages with disk */
-  rc = write(state->data_fd, p1, pagesize * 2);
+  /* rc = write(state->data_fd, p1, pagesize * 2); */
 
-  free(p1);
-  if (rc == pagesize * 2)
-    return BT_SUCC;
-  else
-    return errno;
+  /* free(p1); */
+  /* if (rc == pagesize * 2) */
+  /*   return BT_SUCC; */
+  /* else */
+  /*   return errno; */
+  return BT_SUCC;
 }
 
 static int
@@ -1153,12 +1162,16 @@ _bt_state_load(BT_state *state)
                     state->data_fd,
                     0);
 
-  state->node_freelist = &((BT_page *)state->map)[2]; /* begin allocating nodes
+  state->node_freelist = &((BT_page *)state->map)[3]; /* begin allocating nodes
                                                        on third page (first two
                                                        are for metadata) */
   /* new db, so populate metadata */
   if (new) {
-    if (!SUCC(rc = _bt_state_meta_new(state, &meta))) {
+    /* ;;: tmp, implement differently. Set initial size of pma file */
+    lseek(state->data_fd, BT_PAGESIZE * 1000, SEEK_SET);
+    write(state->data_fd, "", 1);
+
+    if (!SUCC(rc = _bt_state_meta_new(state))) {
       munmap(state->map, BT_ADDRSIZE);
       return rc;
     }
