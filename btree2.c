@@ -90,6 +90,9 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_PAGEWORD 32ULL
 #define BT_PAGESIZE (1ULL << BT_PAGEBITS) /* 16K */
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
+#define PMA_INITIAL_PAGE_SIZE (BT_PAGESIZE * 1000)
+
+#define BT_NOPAGE 0
 
 /*
   FO2BY: file offset to byte
@@ -258,6 +261,7 @@ struct BT_state {
        store a pointer to root in state in addition to avoid a _node_find on it
        every time it's referenced */
   /* BT_page      *root; */
+  size_t        file_len;       /* the length of the pma file */
   unsigned int  which;          /* which double-buffered db are we using? */
   BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
@@ -295,6 +299,7 @@ _node_get(BT_state *state, pgno_t pgno)
   /* for now, this works because the 2M sector is at the beginning of both the
      memory arena and pma file
   */
+  if (pgno <= 1) return 0;      /* no nodes stored at 0 and 1 (metapages) */
   assert((pgno * BT_PAGESIZE) < MBYTES(2));
   return FO2PA(state->map, pgno);
 }
@@ -337,7 +342,7 @@ _node_cow(BT_state *state, BT_page *node, BT_page **newnode, pgno_t *pgno)
 {
   BT_page *ret = _node_alloc(state);
   memcpy(ret->datk, node->datk, sizeof node->datk[0] * BT_DAT_MAXENTRIES);
-  *pgno = _fo_get(state, *newnode);
+  *pgno = _fo_get(state, ret);
   *newnode = ret;
   return BT_SUCC;
 }
@@ -363,6 +368,7 @@ _bt_childidx(BT_page *node, vaof_t lo, vaof_t hi)
 /* looks up the child index in a parent node. If not found, return is
    BT_DAT_MAXKEYS */
 {
+  if (!node) bp(0);             /* ;;: tmp. debugging sigsegv */
   size_t i = 0;
   for (; i < BT_DAT_MAXKEYS - 1; i++) {
     vaof_t llo = node->datk[i].va;
@@ -530,6 +536,7 @@ _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
 
   /* ;;: fix this */
   *newchild = _fo_get(state, right);
+  state->meta_pages[state->which]->depth += 1;
 
   return BT_SUCC;
 }
@@ -602,8 +609,7 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
      decision afaict.
   */
 
-  assert(node != 0);
-  assert(depth > 0);            /* routine doesn't handle root splitting */
+  assert(node);
 
   int rc = 255;
   size_t N = _bt_numkeys(node);
@@ -691,7 +697,8 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
   }
 
   /* CoW root's child if it isn't already dirty */
-  if (!_bt_ischilddirty(root, childidx)) {
+  if (child
+      && !_bt_ischilddirty(root, childidx)) {
     BT_page *newchild;
     pgno_t  newchildpg;
     _node_cow(state, child, &newchild, &newchildpg);
@@ -734,7 +741,8 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
     root's child in insert path is dirty and split if necessary
     finally, recurse on child
   */
-  return _bt_insert2(state, lo, hi, fo, child, 1);
+  return _bt_insert2(state, lo, hi, fo, root, 1);
+  /* return _bt_insert2(state, lo, hi, fo, child, 1); */
 }
 
 /* ;;: wip */
@@ -807,6 +815,8 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
   head = prev = 0;
   for (; i < BT_DAT_MAXKEYS; ++i) {
     BT_kv kv = node->datk[i];
+    if (kv.fo == BT_NOPAGE)
+      continue;
     BT_page *child = _node_get(state, kv.fo);
     BT_mlistnode *new = _mlist_create2(state, child, maxdepth, depth+1);
     if (head == 0) {
@@ -994,6 +1004,8 @@ _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
   head = prev = 0;
   for (; i < BT_DAT_MAXKEYS; ++i) {
     BT_kv kv = node->datk[i];
+    if (kv.fo == BT_NOPAGE)
+      continue;
     BT_page *child = _node_get(state, kv.fo);
     BT_flistnode *new = _flist_create2(state, child, maxdepth, depth+1);
     if (head == 0) {
@@ -1152,6 +1164,7 @@ _bt_state_load(BT_state *state)
   if (!SUCC(rc = _bt_state_read_header(state, &meta))) {
     if (rc != ENOENT) return rc;
     DPUTS("creating new db");
+    state->file_len = PMA_INITIAL_PAGE_SIZE;
     new = 1;
   }
 
@@ -1168,7 +1181,7 @@ _bt_state_load(BT_state *state)
   /* new db, so populate metadata */
   if (new) {
     /* ;;: tmp, implement differently. Set initial size of pma file */
-    lseek(state->data_fd, BT_PAGESIZE * 1000, SEEK_SET);
+    lseek(state->data_fd, state->file_len, SEEK_SET);
     write(state->data_fd, "", 1);
 
     if (!SUCC(rc = _bt_state_meta_new(state))) {
