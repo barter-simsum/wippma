@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <inttypes.h>
 
 typedef uint32_t pgno_t;        /* a page number */
 typedef uint32_t vaof_t;        /* a virtual address offset */
@@ -25,6 +26,7 @@ typedef unsigned long ULONG;
   inside a debugger, this can be caught and ignored. It's equivalent to a
   breakpoint. If run without a debugger, it will dump core, like an assert
 */
+#ifdef DEBUG
 #if defined(__i386__) || defined(__x86_64__)
 #define bp(x) do { if(!(x)) __asm__ volatile("int $3"); } while (0)
 #elif defined(__thumb__)
@@ -35,6 +37,9 @@ typedef unsigned long ULONG;
 #define bp(x) do { if(!(x)) __asm__ volatile(".inst 0xe7f001f0"); } while (0)
 #else
 STATIC_ASSERT(0, "debugger break instruction unimplemented");
+#endif
+#else
+#define bp(x) ((void)(0))
 #endif
 
 /* coalescing of memory freelist currently prohibited since we haven't
@@ -175,6 +180,7 @@ struct BT_kv {
 #define BT_DAT_MAXBYTES (BT_PAGESIZE - sizeof(BT_pageheader))
 #define BT_DAT_MAXENTRIES  (BT_DAT_MAXBYTES / sizeof(BT_dat))
 #define BT_DAT_MAXKEYS (BT_DAT_MAXENTRIES / 2)
+/* #define BT_DAT_MAXKEYS 10 */
 #define BT_DAT_MAXVALS BT_DAT_MAXKEYS
 static_assert(BT_DAT_MAXENTRIES % 2 == 0);
 
@@ -272,6 +278,8 @@ struct BT_state {
 
 //// ===========================================================================
 ////                            btree internal routines
+
+static void _bt_printnode(BT_page *node); /* ;;: tmp */
 
 #define BT_MAXDEPTH 4           /* ;;: todo derive it */
 typedef struct BT_findpath BT_findpath;
@@ -383,13 +391,13 @@ _bt_childidx(BT_page *node, vaof_t lo, vaof_t hi)
 /* a leaf has a meta page depth eq to findpath depth */
 static int
 _bt_find2(BT_state *state,
-          BT_page *page,
+          BT_page *node,
           BT_findpath *path,
           uint8_t maxdepth,
           vaof_t lo,
           vaof_t hi)
 {
-  /* ;;: meta page stores depth (node or leaf?)
+  /* ;;: meta node stores depth (node or leaf?)
      look at root node and binsearch BT_dats where low is <= lo and high is >= hi
      If at depth of metapage (a leaf), then done
      otherwise grab node, increment depth, save node in path
@@ -397,21 +405,24 @@ _bt_find2(BT_state *state,
   if (path->depth > maxdepth)
     return ENOENT;
 
+  if (node == 0) bp(0);
+  assert(node != 0);
+
   size_t i;
-  if ((i = _bt_childidx(page, lo, hi)) == BT_DAT_MAXKEYS)
+  if ((i = _bt_childidx(node, lo, hi)) == BT_DAT_MAXKEYS)
     return ENOENT;
 
   if (is_leaf(path->depth, maxdepth)) {
     path->idx[path->depth] = i;
-    path->path[path->depth] = page;
+    path->path[path->depth] = node;
     return BT_SUCC;
   }
   /* then branch */
   else {
-    pgno_t fo = page->datk[i].fo;
+    pgno_t fo = node->datk[i].fo;
     BT_page *child = _node_get(state, fo);
     path->idx[path->depth] = i;
-    path->path[path->depth] = page;
+    path->path[path->depth] = node;
     path->depth++;
     return _bt_find2(state, child, path, maxdepth, lo, hi);
   }
@@ -429,6 +440,7 @@ _bt_root_new(BT_page *root)
 static int
 _bt_find(BT_state *state, BT_findpath *path, vaof_t lo, vaof_t hi)
 {
+  path->depth = 1;
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
@@ -554,6 +566,9 @@ static int
 _bt_insertdat(vaof_t lo, vaof_t hi, pgno_t fo,
               BT_page *parent, size_t childidx)
 {
+  DPRINTF("BEFORE INSERT lo %" PRIu32 " hi %" PRIu32 " fo %" PRIu32, lo, hi, fo);
+  /* _bt_printnode(parent); */
+
   /* ;;: TODO confirm this logic is appropriate for branch nodes. (It /should/
        be correct for leaf nodes) */
   vaof_t llo = parent->datk[childidx].va;
@@ -566,27 +581,31 @@ _bt_insertdat(vaof_t lo, vaof_t hi, pgno_t fo,
   }
 
   if (llo == lo) {
-    _bt_datshift(parent, childidx, 1);
+    _bt_datshift(parent, childidx + 1, 1);
     vaof_t oldfo = parent->datk[childidx].fo;
     parent->datk[childidx].fo = fo;
     parent->datk[childidx+1].va = hi;
     parent->datk[childidx+1].fo = oldfo + (hi - llo);
   }
   else if (hhi == hi) {
-    _bt_datshift(parent, childidx, 1);
+    _bt_datshift(parent, childidx + 1, 1);
     parent->datk[childidx+1].va = lo;
     parent->datk[childidx+1].fo = fo;
   }
   else {
-    _bt_datshift(parent, childidx, 2);
+    _bt_datshift(parent, childidx + 1, 2);
     parent->datk[childidx+1].va = lo;
     parent->datk[childidx+1].fo = fo;
     parent->datk[childidx+2].va = hi;
     pgno_t lfo = parent->datk[childidx].fo;
     vaof_t lva = parent->datk[childidx].va;
-    parent->datk[childidx+2].fo = lfo + (hi - lva);
+    parent->datk[childidx+2].fo = (lfo == 0)
+      ? 0
+      : lfo + (hi - lva);
   }
 
+  DPUTS("AFTER INSERT");
+  /* _bt_printnode(parent); */
   return BT_SUCC;
 }
 
@@ -676,8 +695,7 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
-  size_t childidx = _bt_childidx(root, lo, hi);
-  BT_page *child = _node_get(state, root->datk[childidx].fo);
+
   size_t N = _bt_numkeys(root);
 
   /* if the root isn't dirty, cow it and flip the which */
@@ -697,14 +715,15 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
   }
 
   /* CoW root's child if it isn't already dirty */
-  if (child
+  size_t childidx = _bt_childidx(root, lo, hi);
+  if (meta->depth > 1
       && !_bt_ischilddirty(root, childidx)) {
+    BT_page *child = _node_get(state, root->datk[childidx].fo);
     BT_page *newchild;
     pgno_t  newchildpg;
     _node_cow(state, child, &newchild, &newchildpg);
     root->datk[childidx].fo = newchildpg;
     _bt_dirtychild(root, childidx);
-    child = newchild;
   }
 
   /* before calling into recursive insert, handle root splitting since it's
@@ -730,9 +749,11 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
     /* dirty new root's children */
     _bt_dirtychild(rootnew, 0);
     _bt_dirtychild(rootnew, 1);
+    /* update meta page information. (root and depth) */
+    pg = _fo_get(state, rootnew);
+    meta->root = pg;
+    meta->depth += 1;
     root = rootnew;
-    childidx = _bt_childidx(root, lo, hi);
-    child = _node_get(state, root->datk[childidx].fo);
   }
 
   /*
@@ -1397,6 +1418,18 @@ _sham_sync(BT_state *state)
 }
 
 static void
+_bt_printnode(BT_page *node)
+{
+  printf("node: %p\n", node);
+  printf("data: \n");
+  for (size_t i = 0; i < BT_DAT_MAXKEYS; ++i) {
+    if (i && node->datk[i].va == 0)
+      break;
+    printf("[%5zu] %10x %10x\n", i, node->datk[i].va, node->datk[i].fo);
+  }
+}
+
+static void
 _test_nodeinteg(BT_state *state, BT_findpath *path,
                 vaof_t lo, vaof_t hi, pgno_t pg)
 {
@@ -1405,6 +1438,7 @@ _test_nodeinteg(BT_state *state, BT_findpath *path,
 
   assert(SUCC(_bt_find(state, path, lo, hi)));
   parent = path->path[path->depth];
+  /* _bt_printnode(parent); */
   childidx = path->idx[path->depth];
   assert(parent->datk[childidx].fo == pg);
   assert(parent->datk[childidx].va == lo);
