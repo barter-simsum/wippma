@@ -280,6 +280,9 @@ struct BT_state {
 ////                            btree internal routines
 
 static void _bt_printnode(BT_page *node); /* ;;: tmp */
+static int
+_bt_insertdat(vaof_t lo, vaof_t hi, pgno_t fo,
+              BT_page *parent, size_t childidx); /* ;;: tmp */
 
 #define BT_MAXDEPTH 4           /* ;;: todo derive it */
 typedef struct BT_findpath BT_findpath;
@@ -335,6 +338,7 @@ _node_alloc(BT_state *state)
   size_t width = (BYTE *)state->node_freelist - state->map;
   assert(width < MBYTES(2));
   /* ;;: todo confirm data sections are zeroed */
+  /* ZERO(state->node_freelist, BT_PAGESIZE); */
   return state->node_freelist++;
 }
 
@@ -345,6 +349,8 @@ __node_alloc(BT_state *state)
   return 0;
 }
 
+/* ;;: from our usage, _node_cow no longer needs to take indirect pointer to
+     newnode. We don't ever do anything with it */
 static int
 _node_cow(BT_state *state, BT_page *node, BT_page **newnode, pgno_t *pgno)
 {
@@ -524,6 +530,9 @@ _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
   /* ;;: todo: better error handling */
   int rc = BT_SUCC;
   BT_page *left = _node_get(state, node->datk[i].fo);
+  size_t N = _bt_numkeys(left);
+  vaof_t lo = left->datk[0].va;
+  vaof_t hi = left->datk[N-1].va;
   BT_page *right = _node_alloc(state);
   if (right == 0)
     return ENOMEM;
@@ -545,6 +554,10 @@ _bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
 
   /* dirty right child */
   _bt_dirtychild(node, i+1);
+
+  /* insert reference to right child into parent node */
+  bp(0);
+  _bt_insertdat(lo, hi, *newchild, node, i+1);
 
   /* ;;: fix this */
   *newchild = _fo_get(state, right);
@@ -631,10 +644,16 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
   assert(node);
 
   int rc = 255;
-  size_t N = _bt_numkeys(node);
+  size_t N = 0;
   size_t childidx = _bt_childidx(node, lo, hi);
   assert(childidx != BT_DAT_MAXKEYS);
   BT_meta *meta = state->meta_pages[state->which];
+
+  if (depth < meta->depth) {
+    pgno_t childpgno = node->datk[childidx].fo;
+    BT_page *child = _node_get(state, childpgno);
+    N = _bt_numkeys(child);
+  }
 
   /* nullcond: node is a leaf */
   if (meta->depth == depth) {
@@ -663,16 +682,17 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
       /* since we split the child's data, recalculate the child idx */
       /* ;;: note, this can be simplified into a conditional i++ */
       childidx = _bt_childidx(node, lo, hi);
-      _bt_insertdat(lo, hi, rchild_pgno, node, childidx);
+      BT_page *rchild = _node_get(state, rchild_pgno);
+      /* _bt_insertdat(lo, hi, rchild_pgno, node, childidx); */
 
 
       /* now insert the new child into parent... */
       /* ;;: may need to be fixed */
-      _bt_datshift(node, childidx, 1);
-      BT_page *lchild = _node_get(state, node->datk[childidx].fo);
-      BT_page *rchild = _node_get(state, rchild_pgno);
-      node->datk[childidx+1].va = rchild->datk[0].va;
-      node->datk[childidx+1].fo = rchild_pgno;
+      /* _bt_datshift(node, childidx+1, 1); */
+      /* BT_page *lchild = _node_get(state, node->datk[childidx].fo); */
+      /* BT_page *rchild = _node_get(state, rchild_pgno); */
+      /* node->datk[childidx+1].va = rchild->datk[0].va; */
+      /* node->datk[childidx+1].fo = rchild_pgno; */
 
       /* since we split the child's data, recalculate the child idx */
       /* ;;: note, this can be simplified into a conditional i++ */
