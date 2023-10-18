@@ -339,7 +339,7 @@ _node_alloc(BT_state *state)
   assert(width < MBYTES(2));
   /* ;;: todo confirm data sections are zeroed */
   /* ZERO(state->node_freelist, BT_PAGESIZE); */
-  return state->node_freelist++;
+  return ++state->node_freelist;
 }
 
 static BT_page *
@@ -382,7 +382,6 @@ _bt_childidx(BT_page *node, vaof_t lo, vaof_t hi)
 /* looks up the child index in a parent node. If not found, return is
    BT_DAT_MAXKEYS */
 {
-  if (!node) bp(0);             /* ;;: tmp. debugging sigsegv */
   size_t i = 0;
   for (; i < BT_DAT_MAXKEYS - 1; i++) {
     vaof_t llo = node->datk[i].va;
@@ -411,7 +410,6 @@ _bt_find2(BT_state *state,
   if (path->depth > maxdepth)
     return ENOENT;
 
-  if (node == 0) bp(0);
   assert(node != 0);
 
   size_t i;
@@ -478,7 +476,7 @@ _bt_datshift(BT_page *node, size_t i, size_t n)
 {
   assert(i+n < BT_DAT_MAXKEYS); /* check buffer overflow */
   size_t siz = sizeof node->datk[0];
-  size_t bytelen = (BT_DAT_MAXKEYS - i) * siz;
+  size_t bytelen = (BT_DAT_MAXKEYS - i - n) * siz;
   memmove(&node->datk[i+n], &node->datk[i], bytelen);
   ZERO(&node->datk[i], n * siz);
   return BT_SUCC;
@@ -494,6 +492,7 @@ _bt_split_datcopy(BT_page *left, BT_page *right)
   memcpy(right->datk, &left->datk[mid], bytelen);
   /* zero rhs of left */
   ZERO(&left->datk[mid], bytelen); /* ;;: note, this would be unnecessary if we stored node.N */
+  /* the last entry in left should be the first entry in right */
   left->datk[mid].va = right->datk[0].va;
 
   return BT_SUCC;
@@ -525,43 +524,37 @@ _bt_dirtychild(BT_page *parent, size_t child_idx)
 
 /* ;:: assert that the node is dirty when splitting */
 static int
-_bt_split_child(BT_state *state, BT_page *node, size_t i, pgno_t *newchild)
+_bt_split_child(BT_state *state, BT_page *parent, size_t i, pgno_t *newchild)
 {
   /* ;;: todo: better error handling */
+  /* ;;: todo: assert parent and left is dirty */
   int rc = BT_SUCC;
-  BT_page *left = _node_get(state, node->datk[i].fo);
-  size_t N = _bt_numkeys(left);
-  vaof_t lo = left->datk[0].va;
-  vaof_t hi = left->datk[N-1].va;
+  size_t N;
+  BT_page *left = _node_get(state, parent->datk[i].fo);
   BT_page *right = _node_alloc(state);
   if (right == 0)
     return ENOMEM;
   if (!SUCC(rc = _bt_split_datcopy(left, right)))
     return rc;
 
-  /* ;;: todo, we can ofc unconditionally dirty the right child since it was
-       freshly alloced. However, the left child isn't guaranteed
-       dirty. Therefore:
-         - if left is NOT dirty, CoW it and dirty it. Call data copy on
-         CoWed left and freshly alloced right
-
-         - if it IS ALREADY dirty, then just call data copy on original left and
-           freshly alloced right
-
-     alternatively, assert that left is already dirt. Responsibility falls on
-     caller (insert) to ensure node being inserted into is either dirty or CoWed
-  */
-
-  /* dirty right child */
-  _bt_dirtychild(node, i+1);
+  /* adjust high address of left node in parent */
+  N = _bt_numkeys(left);
+  /* parent->datk[i+1].va = left->datk[N-1].va; /\* ;;: is this necessary? *\/ */
 
   /* insert reference to right child into parent node */
-  bp(0);
-  _bt_insertdat(lo, hi, *newchild, node, i+1);
+  N = _bt_numkeys(right);
+  vaof_t lo = right->datk[0].va;
+  vaof_t hi = right->datk[N-1].va;
+
+  _bt_insertdat(lo, hi, _fo_get(state, right), parent, i);
+
+  /* dirty right child */
+  size_t ridx = _bt_childidx(parent, lo, hi);
+  assert(ridx == i+1);          /* 0x100000020100;;: tmp? */
+  _bt_dirtychild(parent, ridx);
 
   /* ;;: fix this */
   *newchild = _fo_get(state, right);
-  state->meta_pages[state->which]->depth += 1;
 
   return BT_SUCC;
 }
@@ -877,7 +870,7 @@ _mlist_create(BT_state *state)
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
-  BT_mlistnode *head = _mlist_create2(state, root, maxdepth, 0);
+  BT_mlistnode *head = _mlist_create2(state, root, maxdepth, 1);
 
   /*
     trace the full freelist and unify nodes one last time
@@ -1067,6 +1060,8 @@ _flist_create(BT_state *state)
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
   BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
+  /* ;;: infinite loop with proper starting depth of 1 */
+  /* BT_flistnode *head = _flist_create2(state, root, maxdepth, 1); */
 
   if (head == 0)
     return BT_SUCC;
@@ -1274,7 +1269,6 @@ _bt_falloc(BT_state *state, size_t pages)
     }
   }
 
-  bp(0);                        /* ;;: tmp dbg. no space found */
   return 0;
 }
 
@@ -1423,7 +1417,7 @@ _sham_sync2(BT_state *state, BT_page *node, uint8_t depth, uint8_t maxdepth)
     BT_kv kv = node->datk[i];
     pgno_t childpg = kv.fo;
     BT_page *child = _node_get(state, childpg);
-    _sham_sync2(state, child, depth++, maxdepth);
+    _sham_sync2(state, child, depth+1, maxdepth);
   }
 }
 
@@ -1434,7 +1428,7 @@ _sham_sync(BT_state *state)
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   meta->flags ^= BP_DIRTY;      /* unset the meta dirty flag */
-  _sham_sync2(state, root, 0, meta->depth);
+  _sham_sync2(state, root, 1, meta->depth);
 }
 
 static void
@@ -1488,13 +1482,15 @@ int main(int argc, char *argv[])
 
   /* the hhi == hi case for more predictable splitting math */
   vaof_t lo = 10;
-  vaof_t hi = BT_DAT_MAXKEYS * 4;
+  /* vaof_t hi = BT_DAT_MAXKEYS * 4; */
+  vaof_t hi = 0xDEADBEEF;
   pgno_t pg = 1;                /* dummy value */
   for (size_t i = 0; i < BT_DAT_MAXKEYS * 4; ++i) {
-    if (i % (BT_DAT_MAXKEYS - 2) == 0)
-      bp(0);                    /* breakpoint on split case */
+    /* if (i % (BT_DAT_MAXKEYS - 2) == 0) */
+    /*   bp(0);                    /\* breakpoint on split case *\/ */
     _bt_insert(state, lo, hi, pg);
-    _test_nodeinteg(state, &path, lo++, hi, pg++);
+    _test_nodeinteg(state, &path, lo, hi, pg);
+    lo++; pg++;
   }
 
   int which = state->which;
