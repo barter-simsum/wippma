@@ -803,8 +803,56 @@ _bt_delete(BT_state *state, vaof_t lo, vaof_t hi)
   return _bt_insert(state, lo, hi, 0);
 }
 
+static int
+_mlist_new(BT_state *state)
+{
+  /* implemented separate from _mlist_read since _mlist_read uses lo va == 0 to
+     stop parsing node's data. This, however, is a valid starting condition when
+     freshly creating the btree */
+
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  assert(root->datk[0].fo == 0);
+
+  vaof_t lo = root->datk[0].va;
+  vaof_t hi = root->datk[1].va;
+  size_t len = B2PAGES(hi - lo);
+
+  BT_mlistnode *head = calloc(1, sizeof *head);
+
+  head->next = 0;
+  head->sz = len;
+  head->va = OFF2ADDR(lo);
+
+  state->mlist = head;
+
+  return BT_SUCC;
+}
+
+static int
+_flist_new(BT_state *state)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  assert(root->datk[0].fo == 0);
+
+  vaof_t lo = root->datk[0].va;
+  vaof_t hi = root->datk[1].va;
+  size_t len = B2PAGES(hi - lo);
+
+  BT_flistnode *head = calloc(1, sizeof *head);
+
+  head->next = 0;
+  head->sz = len;
+  head->pg = 0xBEEF; /* ;;: should we invoke logic to expand the backing file
+                          here? probably. implement it */
+  state->flist = head;
+
+  return BT_SUCC;
+}
+
 static BT_mlistnode *
-_mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
+_mlist_read2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 {
   /* leaf */
   if (depth == maxdepth) {
@@ -852,7 +900,7 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
     if (kv.fo == BT_NOPAGE)
       continue;
     BT_page *child = _node_get(state, kv.fo);
-    BT_mlistnode *new = _mlist_create2(state, child, maxdepth, depth+1);
+    BT_mlistnode *new = _mlist_read2(state, child, maxdepth, depth+1);
     if (head == 0) {
       head = prev = new;
     }
@@ -865,12 +913,12 @@ _mlist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 }
 
 static int
-_mlist_create(BT_state *state)
+_mlist_read(BT_state *state)
 {
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
-  BT_mlistnode *head = _mlist_create2(state, root, maxdepth, 1);
+  BT_mlistnode *head = _mlist_read2(state, root, maxdepth, 1);
 
   /*
     trace the full freelist and unify nodes one last time
@@ -1005,7 +1053,7 @@ _flist_mergesort(BT_flistnode *head)
 }
 
 BT_flistnode *
-_flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
+_flist_read2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 {
   /* leaf */
   if (depth == maxdepth) {
@@ -1041,7 +1089,7 @@ _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
     if (kv.fo == BT_NOPAGE)
       continue;
     BT_page *child = _node_get(state, kv.fo);
-    BT_flistnode *new = _flist_create2(state, child, maxdepth, depth+1);
+    BT_flistnode *new = _flist_read2(state, child, maxdepth, depth+1);
     if (head == 0) {
       head = prev = new;
     }
@@ -1054,14 +1102,14 @@ _flist_create2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 }
 
 static int
-_flist_create(BT_state *state)
+_flist_read(BT_state *state)
 {
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
-  BT_flistnode *head = _flist_create2(state, root, maxdepth, 0);
+  BT_flistnode *head = _flist_read2(state, root, maxdepth, 0);
   /* ;;: infinite loop with proper starting depth of 1 */
-  /* BT_flistnode *head = _flist_create2(state, root, maxdepth, 1); */
+  /* BT_flistnode *head = _flist_read2(state, root, maxdepth, 1); */
 
   if (head == 0)
     return BT_SUCC;
@@ -1233,6 +1281,15 @@ _bt_state_load(BT_state *state)
   if (!SUCC(rc = _bt_state_meta_which(state, &which)))
     return rc;
 
+  if (new) {
+    _mlist_new(state);
+    _flist_new(state);
+  }
+  else {
+    _mlist_read(state);
+    _flist_read(state);
+  }
+
   return BT_SUCC;
 }
 
@@ -1325,7 +1382,7 @@ bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
     goto e;
   }
 
-  state->path = strdup(path);
+  state->path = strdup(dpath);
 
  e:
   /* cleanup FDs stored in state if anything failed */
@@ -1345,12 +1402,12 @@ bt_state_close(BT_state *state)
   if (state->data_fd != -1) CLOSE_FD(state->data_fd);
   if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
 
+  _mlist_delete(state);
+  _flist_delete(state);
+
   /* ;;: wip delete the file because we haven't implemented persistence yet */
   if (!SUCC(rc = remove(state->path)))
     return rc;
-
-  _mlist_delete(state);
-  _flist_delete(state);
 
   return BT_SUCC;
 }
@@ -1463,11 +1520,12 @@ int main(int argc, char *argv[])
 {
   BT_state *state;
   BT_findpath path = {0};
+  int rc = 0;
 
   bt_state_new(&state);
-  bt_state_open(state, "./pmatest", 0, 0644);
-  _mlist_create(state);
-  _flist_create(state);
+  assert(SUCC(bt_state_open(state, "./pmatest", 0, 0644)));
+  _mlist_read(state);
+  _flist_read(state);
 
   /* ;;: haven't implemented bt_state_close yet - though it shouldn't be
      terribly hard, so should just run these tests independently by commenting
@@ -1502,16 +1560,16 @@ int main(int argc, char *argv[])
   }
   assert(which != state->which);
 
-  bt_state_close(state);
+  assert(SUCC(bt_state_close(state)));
 
 
   
   //// ===========================================================================
   ////                                    test2
 
-  bt_state_open(state, "./pmatest", 0, 644);
-  _mlist_create(state);
-  _flist_create(state);
+  assert(SUCC(bt_state_open(state, "./pmatest", 0, 644)));
+  _mlist_read(state);
+  _flist_read(state);
 
   /* varieties of insert */
 
@@ -1563,7 +1621,7 @@ int main(int argc, char *argv[])
   _bt_delete(state, lo, hi);
   _bt_delete(state, lo+2, hi);
 
-  bt_state_close(state);
+  assert(SUCC(bt_state_close(state)));
 
   return 0;
 }
