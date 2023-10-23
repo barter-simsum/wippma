@@ -95,7 +95,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_PAGEWORD 32ULL
 #define BT_PAGESIZE (1ULL << BT_PAGEBITS) /* 16K */
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
-#define PMA_INITIAL_PAGE_SIZE (BT_PAGESIZE * 1000)
+#define PMA_INITIAL_PAGE_SIZE (BT_PAGESIZE * 1024)
 
 #define BT_NOPAGE 0
 
@@ -205,6 +205,14 @@ static_assert(BT_DAT_MAXBYTES % sizeof(BT_dat) == 0);
    a meta page is like any other page, but the data section is used to store
    additional information
 */
+#define BLK_BASE_LEN0 MBYTES(2)
+#define BLK_BASE_LEN1 (BLK_BASE_LEN0 * 4)
+#define BLK_BASE_LEN2 (BLK_BASE_LEN1 * 4)
+#define BLK_BASE_LEN3 (BLK_BASE_LEN2 * 4)
+#define BLK_BASE_LEN4 (BLK_BASE_LEN3 * 4)
+#define BLK_BASE_LEN5 (BLK_BASE_LEN4 * 4)
+#define BLK_BASE_LEN6 (BLK_BASE_LEN5 * 4)
+#define BLK_BASE_LEN7 (BLK_BASE_LEN6 * 4)
 typedef struct BT_meta BT_meta;
 struct BT_meta {
   uint32_t  magic;
@@ -254,11 +262,11 @@ typedef struct BT_state BT_state;
 struct BT_state {
   uint16_t      flags;          /* ;;: rem */
   int           data_fd;
-  int           meta_fd; /* ;;: confident can be removed because we're not explicitly calling write() */
+  int           meta_fd;        /* ;;: confident can be removed because we're not explicitly calling write() */
   char         *path;
   ULONG         branch_page_cnt; /* ;;: rem */
-  ULONG         leaf_page_cnt;   /* ;;: rem */
-  ULONG         depth;           /* ;;: rem */
+  ULONG         leaf_page_cnt;  /* ;;: rem */
+  ULONG         depth;          /* ;;: rem */
   void         *fixaddr;
   BYTE         *map;
   BT_page      *node_freelist;
@@ -267,7 +275,8 @@ struct BT_state {
        store a pointer to root in state in addition to avoid a _node_find on it
        every time it's referenced */
   /* BT_page      *root; */
-  size_t        file_len;       /* the length of the pma file */
+  off_t         file_size;      /* the size of the pma file in bytes */
+  pgno_t        frontier;       /* last page in use by pma */
   unsigned int  which;          /* which double-buffered db are we using? */
   BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
@@ -311,6 +320,8 @@ _node_get(BT_state *state, pgno_t pgno)
      memory arena and pma file
   */
   if (pgno <= 1) return 0;      /* no nodes stored at 0 and 1 (metapages) */
+  /* TODO: when partition striping is implemented, a call beyond the furthest
+     block base should result in the allocation of a new block base */
   assert((pgno * BT_PAGESIZE) < MBYTES(2));
   return FO2PA(state->map, pgno);
 }
@@ -1157,24 +1168,101 @@ _flist_delete(BT_state *state)
   } while(0)
 
 static int
-_bt_state_read_header(BT_state *state, BT_meta *meta)
+_bt_state_meta_which(BT_state *state, int *which)
+{
+  BT_meta *m1 = state->meta_pages[0];
+  BT_meta *m2 = state->meta_pages[1];
+  *which = -1;
+
+  if (m1->flags & BP_DIRTY
+      && m2->flags & BP_DIRTY) {
+    DPUTS("Error, both metapages dirty");
+    return EINVAL;
+  }
+
+  if (m1->flags & BP_DIRTY) {
+    /* first is dirty */
+    *which = 1;
+  }
+  else if (m2->flags & BP_DIRTY) {
+    /* second is dirty */
+    *which = 0;
+  }
+  else if (m1->txnid > m2->txnid) {
+    /* first is most recent */
+    *which = 0;
+  }
+  else {
+    /* otherwise, second is most recent */
+    *which = 1;
+  }
+
+  return BT_SUCC;
+}
+
+static int
+_bt_state_read_header(BT_state *state)
 {
   /* TODO: actually read the header and copy the data to meta when we implement
      persistence */
-  BYTE bytes[BT_PAGESIZE];
-  int len;
+  BT_page metas[2];
+  int rc, len, which;
+  BT_page *p = (BT_page *)state->map;
+  BT_meta *m1, *m2;
 
+
+  /* ;;: TODO, need to store last page in use by pma in both metadata pages. choose the frontier after _bt_state_meta_which and store it in state */
   TRACE();
 
-  len = pread(state->data_fd, bytes, BT_PAGESIZE, 0);
+  if ((len = pread(state->data_fd, metas, BT_PAGESIZE*2, 0))
+      != BT_PAGESIZE*2) {
+    /* new pma */
+    assert(errno == ENOENT);
+    return errno;
+  }
 
-  /* TODO: since we haven't implemented persistence yet, a persistent file
-     shouldn't exist. When we do implement persistence, conditionally parse the
-     metadata if it exists */
-  assert(errno = ENOENT);
-  assert(len == 0);
+  /* pma already exists, parse metadata file */
+  m1 = state->meta_pages[0] = METADATA(p);
+  m2 = state->meta_pages[1] = METADATA(p + 1);
 
-  return errno;
+  /* validate magic */
+  if (m1->magic != BT_MAGIC) {
+    DPRINTF("metapage 0x%pX inconsistent magic: 0x%" PRIX32, m1, m1->magic);
+    return EINVAL;
+  }
+  if (m2->magic != BT_MAGIC) {
+    DPRINTF("metapage 0x%pX inconsistent magic: 0x%" PRIX32, m2, m2->magic);
+    return EINVAL;
+  }
+
+  /* validate flags */
+  if (m1->flags & BP_META != BP_META) {
+    DPRINTF("metapage 0x%pX missing meta page flag", m1);
+    return EINVAL;
+  }
+  if (m2->flags & BP_META != BP_META) {
+    DPRINTF("metapage 0x%pX missing meta page flag", m2);
+    return EINVAL;
+  }
+
+  /* validate binary version */
+  if (m1->version != BT_VERSION) {
+    DPRINTF("version mismatch on metapage: 0x%pX, metapage version: %" PRIu32 ", binary version %u",
+            m1, m1->version, BT_VERSION);
+    return EINVAL;
+  }
+
+  /* validate binary version */
+  if (m2->version != BT_VERSION) {
+    DPRINTF("version mismatch on metapage: 0x%pX, metapage version: %" PRIu32 ", binary version %u",
+            m2, m2->version, BT_VERSION);
+    return EINVAL;
+  }
+
+  if (!SUCC(rc = _bt_state_meta_which(state, &which)))
+    return rc;
+
+  return BT_SUCC;
 }
 
 static int
@@ -1228,27 +1316,18 @@ _bt_state_meta_new(BT_state *state)
 }
 
 static int
-_bt_state_meta_which(BT_state *state, int *which)
-{
-  /* TODO */
-  *which = 0;
-  return BT_SUCC;
-}
-
-static int
 _bt_state_load(BT_state *state)
 {
-  int rc, which;
+  int rc;
   int new = 0;
-  BT_meta meta = {0};
-  BT_page *p = 0;
+  struct stat stat;
 
   TRACE();
 
-  if (!SUCC(rc = _bt_state_read_header(state, &meta))) {
+  if (!SUCC(rc = _bt_state_read_header(state))) {
     if (rc != ENOENT) return rc;
     DPUTS("creating new db");
-    state->file_len = PMA_INITIAL_PAGE_SIZE;
+    state->file_size = PMA_INITIAL_PAGE_SIZE;
     new = 1;
   }
 
@@ -1265,7 +1344,7 @@ _bt_state_load(BT_state *state)
   /* new db, so populate metadata */
   if (new) {
     /* ;;: tmp, implement differently. Set initial size of pma file */
-    lseek(state->data_fd, state->file_len, SEEK_SET);
+    lseek(state->data_fd, state->file_size, SEEK_SET);
     write(state->data_fd, "", 1);
 
     if (!SUCC(rc = _bt_state_meta_new(state))) {
@@ -1273,13 +1352,12 @@ _bt_state_load(BT_state *state)
       return rc;
     }
   }
+  else {
+    if (fstat(state->data_fd, &stat) != 0)
+      return errno;
 
-  p = (BT_page *)state->map;
-  state->meta_pages[0] = METADATA(p);
-  state->meta_pages[1] = METADATA(p + 1);
-
-  if (!SUCC(rc = _bt_state_meta_which(state, &which)))
-    return rc;
+    state->file_size = stat.st_size;
+  }
 
   if (new) {
     _mlist_new(state);
@@ -1349,12 +1427,6 @@ bt_state_new(BT_state **state)
 int
 bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
 {
-  /*
-    since we aren't implementing persistence for now, we should just init a
-    fresh BT_state
-
-    TODO: read the data file and restore the persistent state
-  */
   int oflags, rc;
   char *dpath;
 
@@ -1524,8 +1596,7 @@ int main(int argc, char *argv[])
 
   bt_state_new(&state);
   assert(SUCC(bt_state_open(state, "./pmatest", 0, 0644)));
-  _mlist_read(state);
-  _flist_read(state);
+  void * xxx = bt_malloc(state, 10);
 
   /* ;;: haven't implemented bt_state_close yet - though it shouldn't be
      terribly hard, so should just run these tests independently by commenting
