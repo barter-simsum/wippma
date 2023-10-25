@@ -95,7 +95,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_PAGEWORD 32ULL
 #define BT_PAGESIZE (1ULL << BT_PAGEBITS) /* 16K */
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
-#define PMA_INITIAL_PAGE_SIZE (BT_PAGESIZE * 1024)
+#define PMA_GROW_SIZE (BT_PAGESIZE * 1024)
 
 #define BT_NOPAGE 0
 
@@ -265,8 +265,8 @@ struct BT_state {
   int           meta_fd;        /* ;;: confident can be removed because we're not explicitly calling write() */
   char         *path;
   ULONG         branch_page_cnt; /* ;;: rem */
-  ULONG         leaf_page_cnt;  /* ;;: rem */
-  ULONG         depth;          /* ;;: rem */
+  ULONG         leaf_page_cnt;   /* ;;: rem */
+  ULONG         depth;           /* ;;: rem */
   void         *fixaddr;
   BYTE         *map;
   BT_page      *node_freelist;
@@ -276,7 +276,7 @@ struct BT_state {
        every time it's referenced */
   /* BT_page      *root; */
   off_t         file_size;      /* the size of the pma file in bytes */
-  pgno_t        frontier;       /* last page in use by pma */
+  pgno_t        frontier;       /* last non-free page in use by pma (exclusive) */
   unsigned int  which;          /* which double-buffered db are we using? */
   BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
@@ -680,29 +680,10 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
       if (!SUCC(rc = _bt_split_child(state, node, childidx, &rchild_pgno)))
         return rc;
 
-      
-      /* ;;: FIX FIX FIX FIX FIX { */
-
-      /* since we split the child's data, recalculate the child idx */
-      /* ;;: note, this can be simplified into a conditional i++ */
-      childidx = _bt_childidx(node, lo, hi);
-      BT_page *rchild = _node_get(state, rchild_pgno);
-      /* _bt_insertdat(lo, hi, rchild_pgno, node, childidx); */
-
-
-      /* now insert the new child into parent... */
-      /* ;;: may need to be fixed */
-      /* _bt_datshift(node, childidx+1, 1); */
-      /* BT_page *lchild = _node_get(state, node->datk[childidx].fo); */
-      /* BT_page *rchild = _node_get(state, rchild_pgno); */
-      /* node->datk[childidx+1].va = rchild->datk[0].va; */
-      /* node->datk[childidx+1].fo = rchild_pgno; */
-
       /* since we split the child's data, recalculate the child idx */
       /* ;;: note, this can be simplified into a conditional i++ */
       childidx = _bt_childidx(node, lo, hi);
 
-      /* } */
   }
 
   /* the child is now guaranteed non-full (split) and dirty. Recurse */
@@ -792,19 +773,13 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
 
 /* ;;: wip */
 /* ;;: inspired by lmdb's MDB_pageparent. While seemingly unnecessary for
-     _bt_insert, this may be useful for _bt_delete */
+     _bt_insert, this may be useful for _bt_delete when we implement deletion
+     coalescing */
 typedef struct BT_ppage BT_ppage;
 struct BT_ppage {
   BT_page *node;
   BT_page *parent;
 };
-
-/* static int */
-/* _bt_ppage_get(BT_state *state, size_t childidx, BT_ppage **bpp) */
-/* { */
-/*   BT_page *child = _node_get(state, pgno); */
-/*   (*bpp)->node = child; */
-/* } */
 
 static int
 _bt_delete(BT_state *state, vaof_t lo, vaof_t hi)
@@ -836,6 +811,61 @@ _mlist_new(BT_state *state)
   head->va = OFF2ADDR(lo);
 
   state->mlist = head;
+
+  return BT_SUCC;
+}
+
+static int
+_flist_grow(BT_state *state, BT_flistnode *space)
+/* growing the flist consists of expanding the backing persistent file, pushing
+   that space onto the disk freelist, and updating the dimension members in
+   BT_state */
+{
+  /* ;;: I don't see any reason to grow the backing file non-linearly, but we
+       may want to adjust the size of the amount grown based on performance
+       testing. */
+  if (-1 == lseek(state->data_fd, state->file_size + PMA_GROW_SIZE, SEEK_SET))
+    return errno;
+  if (-1 == write(state->data_fd, "", 1))
+    return errno;
+
+
+  /* find the last node in the disk freelist */
+  BT_flistnode *tail = state->flist;
+  for (; tail->next; tail = tail->next)
+    ;
+
+  pgno_t lastpgfree = tail->pg + tail->sz;
+
+  /* ;;: TODO, make sure you are certain of this logic. Further, add assertions
+       regarding relative positions of state->file_size, state->frontier, and
+       lastpgfree
+
+       we MAY call into this routine even if there is freespace on the end
+       because it's possible that freespace isn't large enough. We may also call
+       into this routine when the frontier exceeds the last free pg because
+       that's just how freelists work. ofc, frontier should never exceed
+       file_size. what other assertions??
+
+  */
+
+  /* if the frontier (last pg in use) is less than the last page free, we should
+     coalesce the new node with the tail. */
+  if (state->frontier <= lastpgfree) {
+    tail->sz += PMA_GROW_SIZE;
+  }
+  /* otherwise, a new node needs to be allocated */
+  else {
+    BT_flistnode *new = calloc(1, sizeof *new);
+    /* since the frontier exceeds the last pg free, new freespace should
+       naturally be allocated at the frontier */
+    new->pg = state->frontier;
+    new->sz = PMA_GROW_SIZE;
+    tail->next = new;
+  }
+
+  /* finally, update the file size */
+  state->file_size += PMA_GROW_SIZE;
 
   return BT_SUCC;
 }
@@ -1119,7 +1149,7 @@ _flist_read(BT_state *state)
   BT_page *root = _node_get(state, meta->root);
   uint8_t maxdepth = meta->depth;
   BT_flistnode *head = _flist_read2(state, root, maxdepth, 0);
-  /* ;;: infinite loop with proper starting depth of 1 */
+  /* ;;: infinite loop with proper starting depth of 1. -- fix that! */
   /* BT_flistnode *head = _flist_read2(state, root, maxdepth, 1); */
 
   if (head == 0)
@@ -1295,8 +1325,6 @@ _bt_state_meta_new(BT_state *state)
   /* initialize the metapages */
   p1 = &((BT_page *)state->map)[0];
   p2 = &((BT_page *)state->map)[1];
-  /* p1 = calloc(2, BT_PAGESIZE); */
-  /* p2 = p1 + 1; */
 
   /* copy the metadata into the metapages */
   memcpy(METADATA(p1), &meta, sizeof meta);
@@ -1304,14 +1332,6 @@ _bt_state_meta_new(BT_state *state)
        first?? */
   memcpy(METADATA(p2), &meta, sizeof meta);
 
-  /* sync new meta pages with disk */
-  /* rc = write(state->data_fd, p1, pagesize * 2); */
-
-  /* free(p1); */
-  /* if (rc == pagesize * 2) */
-  /*   return BT_SUCC; */
-  /* else */
-  /*   return errno; */
   return BT_SUCC;
 }
 
@@ -1327,7 +1347,7 @@ _bt_state_load(BT_state *state)
   if (!SUCC(rc = _bt_state_read_header(state))) {
     if (rc != ENOENT) return rc;
     DPUTS("creating new db");
-    state->file_size = PMA_INITIAL_PAGE_SIZE;
+    state->file_size = PMA_GROW_SIZE;
     new = 1;
   }
 
@@ -1343,9 +1363,12 @@ _bt_state_load(BT_state *state)
                                                        are for metadata) */
   /* new db, so populate metadata */
   if (new) {
-    /* ;;: tmp, implement differently. Set initial size of pma file */
-    lseek(state->data_fd, state->file_size, SEEK_SET);
-    write(state->data_fd, "", 1);
+    if (-1 == lseek(state->data_fd, state->file_size, SEEK_SET))
+      return errno;
+    if (-1 == write(state->data_fd, "", 1))
+      return errno;
+
+    state->file_size = PMA_GROW_SIZE;
 
     if (!SUCC(rc = _bt_state_meta_new(state))) {
       munmap(state->map, BT_ADDRSIZE);
@@ -1597,10 +1620,6 @@ int main(int argc, char *argv[])
   bt_state_new(&state);
   assert(SUCC(bt_state_open(state, "./pmatest", 0, 0644)));
   void * xxx = bt_malloc(state, 10);
-
-  /* ;;: haven't implemented bt_state_close yet - though it shouldn't be
-     terribly hard, so should just run these tests independently by commenting
-     them out for now */
 
   
   //// ===========================================================================
