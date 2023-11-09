@@ -12,6 +12,8 @@
 #include <string.h>
 #include <inttypes.h>
 
+#include "lib/checksum.h"
+
 typedef uint32_t pgno_t;        /* a page number */
 typedef uint32_t vaof_t;        /* a virtual address offset */
 typedef uint32_t flag_t;
@@ -120,6 +122,13 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define FO2PA(map, fo)                          \
   ((BT_page *)&(map)[FO2BY(fo)])
 
+/* NMEMB: number of members in array, a */
+#define NMEMB(a)                                \
+  (sizeof(a[0]) / sizeof(a))
+
+#define offsetof(st, m) \
+    __builtin_offsetof(st, m)
+
 
 //// ===========================================================================
 ////                                  btree types
@@ -222,7 +231,6 @@ struct BT_meta {
   uint64_t  txnid;
   void     *fix_addr;           /* fixed addr of btree */
 
-  uint32_t chk;                 /* checksum */
   pgno_t   blk_base[8];         /* block base array for striped node partition */
   uint8_t  blk_cnt;             /* currently highest valid block base */
   uint8_t  depth;               /* tree depth */
@@ -231,6 +239,7 @@ struct BT_meta {
   uint8_t  flags;
   uint8_t  _pad1;
   pgno_t   root;
+  uint32_t chk;                 /* checksum */
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
 
@@ -283,6 +292,11 @@ struct BT_state {
   BT_flistnode *flist;          /* pma file freelist */
 };
 
+/*
+  ;;: wrt to frontier: if you need to allocate space for data, push the frontier
+     out by that amount allocated. If you're allocating a new stripe, push it to
+     the end of that stripe.
+*/
 
 
 //// ===========================================================================
@@ -528,6 +542,15 @@ _bt_dirtychild(BT_page *parent, size_t child_idx)
   assert(!_bt_ischilddirty(parent, child_idx));
   uint8_t *flag = &parent->head.dirty[child_idx >> 3];
   *flag |= 1 << (child_idx & 0x7);
+  return BT_SUCC;
+}
+
+static int
+_bt_cleanchild(BT_page *parent, size_t child_idx)
+{
+  assert(_bt_ischilddirty(parent, child_idx));
+  uint8_t *flag = &parent->head.dirty[child_idx >> 3];
+  *flag ^= 1 << (child_idx & 0x7);
   return BT_SUCC;
 }
 
@@ -1247,8 +1270,7 @@ _bt_state_read_header(BT_state *state)
   if ((len = pread(state->data_fd, metas, BT_PAGESIZE*2, 0))
       != BT_PAGESIZE*2) {
     /* new pma */
-    assert(errno == ENOENT);
-    return errno;
+    return ENOENT;
   }
 
   /* pma already exists, parse metadata file */
@@ -1540,6 +1562,140 @@ bt_malloc(BT_state *state, size_t pages)
   return ret;
 }
 
+
+static int
+_bt_sync_hasdirtypage(BT_state *state, BT_page *node)
+/* ;;: could be more efficiently replaced by a gcc vectorized builtin */
+{
+  for (size_t i = 0; i < NMEMB(node->head.dirty); i++) {
+    if (node->head.dirty[i] != 0)
+      return 1;
+  }
+
+  return 0;
+}
+
+static int
+_bt_sync_leaf(BT_state *state, BT_page *node)
+{
+  /* msync all of the dirty pages (nodes + data) that are in the dirty bit set
+     of node */
+  pgno_t pg;
+  size_t i = 0;
+
+  for (size_t i = 0; i < BT_DAT_MAXKEYS - 1; i++) {
+    if (!_bt_ischilddirty(node, i))
+      continue;                 /* not dirty. nothing to do */
+
+    /* ;;: we don't actually need the page, do we? */
+    /* pgno_t pg = node->datk[i].fo; */
+    vaof_t lo = node->datk[i].va;
+    vaof_t hi = node->datk[i+1].va;
+    size_t bytelen = hi - lo;
+    void *addr = OFF2ADDR(lo);
+
+    /* sync the page */
+    if (msync(addr, bytelen, MS_SYNC))
+      return errno;
+
+    /* and clean the dirty bit */
+    _bt_cleanchild(node, i);
+  }
+
+  /* ;;: all data pages synced. should we now sync the node as well? No, I think
+       that should be the caller's responsibility */
+
+  /* ;;: it is probably faster to scan the dirty bit set and derive the datk idx
+     rather than iterate over the full datk array and check if it is dirty. This
+     was simpler to implement for now though. */
+  /* while (_bt_sync_hasdirtypage(state, node)) { */
+  /*   ... */
+  /* } */
+
+  return BT_SUCC;
+}
+
+static int
+_bt_sync_meta(BT_state *state)
+/* syncs the metapage and performs necessary checksumming. Additionally, flips
+   the which */
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_meta *newmeta;
+  uint32_t chk;
+  size_t len;
+  int newwhich;
+
+  /* checksum the metapage */
+  len = offsetof(BT_meta, chk);
+  chk = crc_32((unsigned char *)meta, len);
+  meta->chk = chk;
+
+  /* sync the metapage */
+  if (msync(meta, sizeof(BT_page), MS_SYNC))
+    return errno;
+
+  /* zero the new metapage's checksum */
+  newwhich = state->which ? 0 : 1;
+  newmeta = state->meta_pages[newwhich];
+  newmeta->chk = 0;
+
+  /* copy over metapage to new metapage excluding the checksum */
+  memcpy(newmeta, meta, len);
+
+  /* ;;: tmp. remove assert. */
+  assert(newmeta->chk == 0);
+
+  /* clean the old metapage and dirty the new one */
+  meta->flags ^= BP_DIRTY;
+  newmeta->flags |= BP_DIRTY;
+
+  /* finally, switch the metapage we're referring to */
+  state->which = newwhich;
+
+  return BT_SUCC;
+}
+
+static int
+_bt_sync(BT_state *state)
+{
+  return 255;
+}
+
+int
+bt_sync(BT_state *state)
+{
+  /* as is often the case, handling the metapage/root is a special case, which
+     is done here. Syncing any other page of the tree is done in _bt_sync */
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+
+  /* if the root is a leaf, skip the dfs */
+  if (state->depth == 1) {
+    /* sync the root's data */
+    _bt_sync_leaf(state, root);
+
+    /* sync the root page */
+    msync(root, sizeof(BT_page), MS_SYNC);
+
+    /* then sync the metapage */
+    _bt_sync_meta(state);
+  }
+  else {
+
+  }
+
+  if (!_bt_sync_hasdirtypage(state, root)) {
+    /* if there are no other dirty pages than the root, skip the dfs */
+
+  }
+  else {
+
+  }
+
+  return BT_SUCC;
+}
+
 
 //// ===========================================================================
 ////                                    tests
@@ -1715,3 +1871,47 @@ int main(int argc, char *argv[])
 
   return 0;
 }
+
+
+/* ;;:
+
+   1) checksum m1
+   2) sync m1
+   3) zero m2
+   4) copy all of m1 to m2 excluding m1
+
+   The current dirty metapage should have a zero checksum so that it happens to
+   be synced by the OS, it won't be valid.
+
+*/
+
+/* ;;:
+
+   Check if root page is dirty from metapage. if not, exit sync
+
+   Create a queue of dirty pages.
+
+   BFS the tree. Add root page. Add all pages in dirty bit set. Advance read
+   head to next page (index 1) and do the same until read head and write head
+   are equal.
+
+   queue consists of pairs of memory address and length.
+
+   if length field is zero, we'll msync length 1 page. -- which means this is a
+   node. if when iterating over queue, we find a zero length entry, then add
+   that node's dirty page.
+
+   ---
+
+   this /was/ the initial plan after some discussion. But after further
+   discussion, we can actually do a depth first search. To make implementation
+   even more simple, we can do an iterative dfs where we start from the root
+   each time. Why? Because the bulk of time to execute is going to be disc
+   io.
+
+   after each msync of a page, descend to the deepest dirty page. msync that
+   page. set that page's dirty bit in the parent to non-dirty. repeat. once
+   you're at the root page and there are no dirty bits set, sync the
+   root. Finally, sync the metapage (with checksumming).
+
+ */
