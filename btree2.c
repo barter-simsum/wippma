@@ -234,12 +234,14 @@ struct BT_meta {
   pgno_t   blk_base[8];         /* block base array for striped node partition */
   uint8_t  blk_cnt;             /* currently highest valid block base */
   uint8_t  depth;               /* tree depth */
-#define BP_DIRTY 0x01
-#define BP_META  0x02
+#define BP_DIRTY ((uint8_t)0x01) /* ;;: TODO remove dirty flag */
+#define BP_META  ((uint8_t)0x02)
   uint8_t  flags;
   uint8_t  _pad1;
   pgno_t   root;
   uint32_t chk;                 /* checksum */
+
+  /* ;;: TODO: ensure the crc_32 checksum cannot be zero */
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
 
@@ -290,6 +292,19 @@ struct BT_state {
   BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
   BT_flistnode *flist;          /* pma file freelist */
+  /* ;;: for deletion coalescing:
+
+     when freeing data, push onto the pending flist and mlist. When pushing onto
+     the mlist, you can preemptively coalesce. You don't need to coalesce at all
+     in the pending flist.
+
+     when inserting and coalescing, if you can free a node then push onto the
+     pending nlist
+
+  */
+
+  /* BT_flistnode *pending_flist; */
+  /* BT_nlistnode *pending_nlist; */
 };
 
 /*
@@ -734,9 +749,16 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
     if (!SUCC(rc = _node_cow(state, root, &newroot, &newrootpg)))
       return rc;
 
+    /* ;;: _bt_sync_meta handles switching which metapage is currently being
+         used. That should not be done in _bt_insert. We should, however, handle
+         dirtying the root via the BP_DIRTY metapage flag and cowing the root.
+
+         TODO
+
+       */
     /* switch to other metapage and dirty it */
-    state->which = state->which ? 0 : 1;
-    meta = state->meta_pages[state->which];
+    /* state->which = state->which ? 0 : 1; */
+    /* meta = state->meta_pages[state->which]; */
     meta->flags |= BP_DIRTY;
     meta->root = newrootpg;
     root = newroot;
@@ -1578,12 +1600,12 @@ _bt_sync_hasdirtypage(BT_state *state, BT_page *node)
 static int
 _bt_sync_leaf(BT_state *state, BT_page *node)
 {
-  /* msync all of the dirty pages (nodes + data) that are in the dirty bit set
-     of node */
+  /* msync all of a leaf's data that is dirty. The caller is expected to sync
+     the node itself and mark it as clean in the parent. */
   pgno_t pg;
   size_t i = 0;
 
-  for (size_t i = 0; i < BT_DAT_MAXKEYS - 1; i++) {
+  for (size_t i = 0; i < BT_DAT_MAXKEYS-1; i++) {
     if (!_bt_ischilddirty(node, i))
       continue;                 /* not dirty. nothing to do */
 
@@ -1646,10 +1668,6 @@ _bt_sync_meta(BT_state *state)
   /* ;;: tmp. remove assert. */
   assert(newmeta->chk == 0);
 
-  /* clean the old metapage and dirty the new one */
-  meta->flags ^= BP_DIRTY;
-  newmeta->flags |= BP_DIRTY;
-
   /* finally, switch the metapage we're referring to */
   state->which = newwhich;
 
@@ -1657,9 +1675,38 @@ _bt_sync_meta(BT_state *state)
 }
 
 static int
-_bt_sync(BT_state *state)
+_bt_sync(BT_state *state, BT_page *node, uint8_t depth)
+/* recursively syncs the subtree under node. The caller is expected to sync node
+   itself and mark it clean. */
 {
-  return 255;
+  int rc = 0;
+
+  /* leaf */
+  if (depth == state->depth) {
+    _bt_sync_leaf(state, node);
+    return BT_SUCC;
+  }
+
+  /* do dfs */
+  for (size_t i = 0; i < BT_DAT_MAXKEYS-1; i++) {
+    if (!_bt_ischilddirty(node, i))
+      continue;                 /* not dirty. nothing to do */
+
+    BT_page *child = _node_get(state, node->datk[i].fo);
+
+    /* recursively sync the child's data */
+    if (rc = _bt_sync(state, child, depth+1))
+      return rc;
+
+    /* sync the child node */
+    if (msync(child, sizeof(BT_PAGE), MS_SYNC))
+      return errno;
+
+    /* clean the child */
+    _bt_cleanchild(node, i);
+  }
+
+  return BT_SUCC;
 }
 
 int
@@ -1669,29 +1716,21 @@ bt_sync(BT_state *state)
      is done here. Syncing any other page of the tree is done in _bt_sync */
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
+  int rc = 0;
 
-  /* if the root is a leaf, skip the dfs */
-  if (state->depth == 1) {
-    /* sync the root's data */
-    _bt_sync_leaf(state, root);
+  if (rc = _bt_sync(state, root, 1))
+    return rc;
 
-    /* sync the root page */
-    msync(root, sizeof(BT_page), MS_SYNC);
+  /* sync the root page */
+  if (msync(root, sizeof(BT_page), MS_SYNC))
+    return errno;
 
-    /* then sync the metapage */
-    _bt_sync_meta(state);
-  }
-  else {
+  /* set the root as clean */
+  meta->flags &= ~BP_DIRTY;
 
-  }
-
-  if (!_bt_sync_hasdirtypage(state, root)) {
-    /* if there are no other dirty pages than the root, skip the dfs */
-
-  }
-  else {
-
-  }
+  /* then sync the metapage */
+  if (rc = _bt_sync_meta(state))
+    return rc;
 
   return BT_SUCC;
 }
