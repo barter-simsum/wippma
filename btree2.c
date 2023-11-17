@@ -245,13 +245,6 @@ struct BT_meta {
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
 
-typedef struct BT_nlistnode BT_nlistnode;
-struct BT_nlistnode {
-  pgno_t pg;
-  size_t sz;
-  BT_nlistnode *next;
-};
-
 typedef struct BT_mlistnode BT_mlistnode;
 struct BT_mlistnode {
   void *va;                     /* virtual address */
@@ -289,7 +282,7 @@ struct BT_state {
   off_t         file_size;      /* the size of the pma file in bytes */
   pgno_t        frontier;       /* last non-free page in use by pma (exclusive) */
   unsigned int  which;          /* which double-buffered db are we using? */
-  BT_nlistnode *nlist;          /* node freelist */
+  BT_mlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
   BT_flistnode *flist;          /* pma file freelist */
   /* ;;: for deletion coalescing:
@@ -303,8 +296,8 @@ struct BT_state {
 
   */
 
-  /* BT_flistnode *pending_flist; */
-  /* BT_nlistnode *pending_nlist; */
+  BT_flistnode *pending_flist;
+  BT_mlistnode *pending_nlist;
 };
 
 /*
@@ -414,9 +407,6 @@ _bt_bsearch(BT_page *page, vaof_t va)
   return 0;
 }
 
-#define is_leaf(d1, d2) ((d1) == (d2))
-#define is_branch(d1, d2) (!is_leaf(d1, d2))
-
 static size_t
 _bt_childidx(BT_page *node, vaof_t lo, vaof_t hi)
 /* looks up the child index in a parent node. If not found, return is
@@ -456,7 +446,7 @@ _bt_find2(BT_state *state,
   if ((i = _bt_childidx(node, lo, hi)) == BT_DAT_MAXKEYS)
     return ENOENT;
 
-  if (is_leaf(path->depth, maxdepth)) {
+  if (path->depth == maxdepth) {
     path->idx[path->depth] = i;
     path->path[path->depth] = node;
     return BT_SUCC;
@@ -569,8 +559,6 @@ _bt_cleanchild(BT_page *parent, size_t child_idx)
   return BT_SUCC;
 }
 
-#define IS_ROOT(path) ((path)->depth == 0)
-
 /* ;:: assert that the node is dirty when splitting */
 static int
 _bt_split_child(BT_state *state, BT_page *parent, size_t i, pgno_t *newchild)
@@ -679,7 +667,7 @@ _bt_insert2(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo,
        - It's a leaf
        - It's a branch and you CoWed the child
      - Hence, all nodes in a path to a leaf being inserted into need to already
-     be dirty or explicitly CoWed. Splitting doesn't actually factor into this
+     be dirty or explicitly Cowed. Splitting doesn't actually factor into this
      decision afaict.
   */
 
@@ -930,8 +918,8 @@ _flist_new(BT_state *state)
 
   head->next = 0;
   head->sz = len;
-  head->pg = 0xBEEF; /* ;;: should we invoke logic to expand the backing file
-                          here? probably. implement it */
+  head->pg = PMA_GROW_SIZE; /* ;;: should we invoke logic to expand the backing file
+                          here? probably. implement it */ /*  */
   state->flist = head;
 
   return BT_SUCC;
@@ -1282,9 +1270,11 @@ _bt_state_read_header(BT_state *state)
      persistence */
   BT_page metas[2];
   int rc, len, which;
-  BT_page *p = (BT_page *)state->map;
   BT_meta *m1, *m2;
 
+  /* pma already exists, parse metadata file */
+  m1 = state->meta_pages[0];
+  m2 = state->meta_pages[1];
 
   /* ;;: TODO, need to store last page in use by pma in both metadata pages. choose the frontier after _bt_state_meta_which and store it in state */
   TRACE();
@@ -1294,10 +1284,6 @@ _bt_state_read_header(BT_state *state)
     /* new pma */
     return ENOENT;
   }
-
-  /* pma already exists, parse metadata file */
-  m1 = state->meta_pages[0] = METADATA(p);
-  m2 = state->meta_pages[1] = METADATA(p + 1);
 
   /* validate magic */
   if (m1->magic != BT_MAGIC) {
@@ -1384,6 +1370,7 @@ _bt_state_load(BT_state *state)
 {
   int rc;
   int new = 0;
+  BT_page *p;
   struct stat stat;
 
   TRACE();
@@ -1402,11 +1389,16 @@ _bt_state_load(BT_state *state)
                     state->data_fd,
                     0);
 
+  p = (BT_page *)state->map;
+  state->meta_pages[0] = METADATA(p);
+  state->meta_pages[0] = METADATA(p + 1);
+
   state->node_freelist = &((BT_page *)state->map)[3]; /* begin allocating nodes
                                                        on third page (first two
                                                        are for metadata) */
   /* new db, so populate metadata */
   if (new) {
+    /* ;;: move this logic to _flist_new */
     if (-1 == lseek(state->data_fd, state->file_size, SEEK_SET))
       return errno;
     if (-1 == write(state->data_fd, "", 1))
@@ -1473,117 +1465,6 @@ _bt_falloc(BT_state *state, size_t pages)
 
   return 0;
 }
-
-
-//// ===========================================================================
-////                            btree external routines
-
-int
-bt_state_new(BT_state **state)
-{
-  TRACE();
-
-  BT_state *s = calloc(1, sizeof *s);
-  s->meta_fd = s->data_fd = -1;
-  s->fixaddr = BT_MAPADDR;
-  *state = s;
-  return BT_SUCC;
-}
-
-#define DATANAME "/data.pma"
-int
-bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
-{
-  int oflags, rc;
-  char *dpath;
-
-  TRACE();
-  UNUSED(flags);
-
-  oflags = O_RDWR | O_CREAT;
-  dpath = malloc(strlen(path) + sizeof(DATANAME));
-  if (!dpath) return ENOMEM;
-  sprintf(dpath, "%s" DATANAME, path);
-
-  if (mkdir(path, 0774) == -1)
-    return errno;
-
-  if ((state->data_fd = open(dpath, oflags, mode)) == -1)
-    return errno;
-
-  if (!SUCC(rc = _bt_state_load(state)))
-    goto e;
-
-  /* ;;: this may be entirely unnecessary */
-  oflags |= O_DSYNC;            /* see man 2 open */
-  if ((state->meta_fd = open(dpath, oflags, mode)) == -1) {
-    rc = errno;
-    goto e;
-  }
-
-  state->path = strdup(dpath);
-
- e:
-  /* cleanup FDs stored in state if anything failed */
-  if (!SUCC(rc)) {
-    if (state->data_fd != -1) CLOSE_FD(state->data_fd);
-    if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
-  }
-
-  free(dpath);
-  return rc;
-}
-
-int
-bt_state_close(BT_state *state)
-{
-  int rc;
-  if (state->data_fd != -1) CLOSE_FD(state->data_fd);
-  if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
-
-  _mlist_delete(state);
-  _flist_delete(state);
-
-  /* ;;: wip delete the file because we haven't implemented persistence yet */
-  if (!SUCC(rc = remove(state->path)))
-    return rc;
-
-  return BT_SUCC;
-}
-
-void *
-bt_malloc(BT_state *state, size_t pages)
-{
-  BT_mlistnode **n = &state->mlist;
-  void *ret = 0;
-  /* first fit */
-  for (; *n; n = &(*n)->next) {
-    /* perfect fit */
-    if ((*n)->sz == pages) {
-      ret = (*n)->va;
-      *n = (*n)->next;
-      break;
-    }
-    /* larger than necessary: shrink the node */
-    if ((*n)->sz > pages) {
-      ret = (*n)->va;
-      (*n)->sz -= pages;
-      (*n)->va = (BT_page *)(*n)->va + pages;
-      break;
-    }
-  }
-
-  pgno_t pgno = _bt_falloc(state, pages);
-  bp(pgno != 0);
-  _bt_insert(state,
-             ADDR2OFF(ret),
-             ADDR2OFF(ret) + P2BYTES(pages),
-             pgno);
-
-  bp(ret != 0);
-  return ret;
-}
-
 
 static int
 _bt_sync_hasdirtypage(BT_state *state, BT_page *node)
@@ -1699,7 +1580,7 @@ _bt_sync(BT_state *state, BT_page *node, uint8_t depth)
       return rc;
 
     /* sync the child node */
-    if (msync(child, sizeof(BT_PAGE), MS_SYNC))
+    if (msync(child, sizeof(BT_page), MS_SYNC))
       return errno;
 
     /* clean the child */
@@ -1707,6 +1588,198 @@ _bt_sync(BT_state *state, BT_page *node, uint8_t depth)
   }
 
   return BT_SUCC;
+}
+
+
+
+//// ===========================================================================
+////                           wip - deletion coalescing
+
+/* ;;: todo: rename routines */
+
+int
+_bt_delco_1pass_0(BT_state *state, vaof_t lo, vaof_t hi,
+                  BT_page *node, uint8_t depth)
+{
+  /* Perform a dfs search on all ranges that fall within lo and hi */
+
+  /* ;;: we can't use bt_childidx because the range of lo-hi may overlap ofc */
+  size_t loidx = 0;
+  size_t hiidx = 0;
+
+  /* first find the entry that matches lo */
+  size_t i;
+  for (i = 0; i < BT_DAT_MAXKEYS-1; i++) {
+    vaof_t llo = node->datk[i].va;
+    if (llo <= lo) {
+      loidx = i;
+      break;
+    }
+  }
+
+  /* and then the entry that matches hi */
+  for (; i < BT_DAT_MAXKEYS-1; i++) {
+    vaof_t hhi = node->datk[i].va;
+    if (hhi >= hi) {
+      hiidx = hi;
+      break;
+    }
+  }
+
+  /* node->datk[loidx] - node->datk[hiidx] are the bounds on which to perform
+     the dfs */
+  for (i = loidx; i < hiidx; i++) {
+    vaof_t llo = node->datk[i].va;
+    pgno_t pg = node->datk[i].va;
+
+    /* if at the leaf level, terminate with failure if pg is not free */
+    if (depth == state->depth) {
+      if (pg != 0) return 1;
+      else continue;
+    }
+
+    /* otherwise, dfs the child node */
+    BT_page *child = _node_get(state, pg);
+    if (!SUCC(_bt_delco_1pass_0(state, lo, hi, child, depth+1)))
+      return 1;
+  }
+
+  /* whether we're at a leaf or a branch, by now all pages corresponding to the
+     hi-lo range must be free */
+  return BT_SUCC;
+}
+
+int
+_bt_delco_1pass(BT_state *state, vaof_t lo, vaof_t hi)
+/* returns true if the leaves in the given range are all free (pgno of 0). false
+   otherwise. This must be the case for an insert into an overlapping range to
+   succeed */
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+  return _bt_delco_1pass_0(state, lo, hi, root, 1);
+}
+
+
+//// ===========================================================================
+////                            btree external routines
+
+int
+bt_state_new(BT_state **state)
+{
+  TRACE();
+
+  BT_state *s = calloc(1, sizeof *s);
+  s->meta_fd = s->data_fd = -1;
+  s->fixaddr = BT_MAPADDR;
+  *state = s;
+  return BT_SUCC;
+}
+
+#define DATANAME "/data.pma"
+int
+bt_state_open(BT_state *state, const char *path, ULONG flags, mode_t mode)
+{
+  int oflags, rc;
+  char *dpath;
+
+  TRACE();
+  UNUSED(flags);
+
+  oflags = O_RDWR | O_CREAT;
+  dpath = malloc(strlen(path) + sizeof(DATANAME));
+  if (!dpath) return ENOMEM;
+  sprintf(dpath, "%s" DATANAME, path);
+
+  if (mkdir(path, 0774) == -1)
+    return errno;
+
+  if ((state->data_fd = open(dpath, oflags, mode)) == -1)
+    return errno;
+
+  if (!SUCC(rc = _bt_state_load(state)))
+    goto e;
+
+  /* ;;: this may be entirely unnecessary */
+  oflags |= O_DSYNC;            /* see man 2 open */
+  if ((state->meta_fd = open(dpath, oflags, mode)) == -1) {
+    rc = errno;
+    goto e;
+  }
+
+  state->path = strdup(dpath);
+
+ e:
+  /* cleanup FDs stored in state if anything failed */
+  if (!SUCC(rc)) {
+    if (state->data_fd != -1) CLOSE_FD(state->data_fd);
+    if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
+  }
+
+  free(dpath);
+  return rc;
+}
+
+int
+bt_state_close(BT_state *state)
+{
+  int rc;
+  if (state->data_fd != -1) CLOSE_FD(state->data_fd);
+  if (state->meta_fd != -1) CLOSE_FD(state->meta_fd);
+
+  _mlist_delete(state);
+  _flist_delete(state);
+
+  /* ;;: wip delete the file because we haven't implemented persistence yet */
+  if (!SUCC(rc = remove(state->path)))
+    return rc;
+
+  return BT_SUCC;
+}
+
+void *
+bt_malloc(BT_state *state, size_t pages)
+{
+  BT_mlistnode **n = &state->mlist;
+  void *ret = 0;
+  /* first fit */
+  for (; *n; n = &(*n)->next) {
+    /* perfect fit */
+    if ((*n)->sz == pages) {
+      ret = (*n)->va;
+      *n = (*n)->next;
+      break;
+    }
+    /* larger than necessary: shrink the node */
+    if ((*n)->sz > pages) {
+      ret = (*n)->va;
+      (*n)->sz -= pages;
+      (*n)->va = (BT_page *)(*n)->va + pages;
+      break;
+    }
+  }
+
+  pgno_t pgno = _bt_falloc(state, pages);
+  bp(pgno != 0);
+  _bt_insert(state,
+             ADDR2OFF(ret),
+             ADDR2OFF(ret) + P2BYTES(pages),
+             pgno);
+
+  bp(ret != 0);
+  return ret;
+}
+
+void
+bt_free(BT_state *state, void * p)
+{
+  vaof_t lo = ADDR2OFF(p);
+  /* ;;: next, need to determine hi address so that _bt_delete can be
+     called. How do we do this? Obviously, this isn't stored in the memory
+     freelist which tracks only freespace. But all btree operations we've
+     written are built on the premise that we have a lo and hi address. Is there
+     any way we can derive this without adding another ephemeral data structure
+     to track the bounds of allocations? */
 }
 
 int
@@ -1812,13 +1885,48 @@ int main(int argc, char *argv[])
   BT_findpath path = {0};
   int rc = 0;
 
+
+//// ===========================================================================
+////                                  test0 wip
+
+  /* deletion coalescing */
   bt_state_new(&state);
   assert(SUCC(bt_state_open(state, "./pmatest", 0, 0644)));
-  void * xxx = bt_malloc(state, 10);
 
-  
+  /* enable coalescing of the memory freelist */
+#undef  CAN_COALESCE
+#define CAN_COALESCE 1
+
+  /* ;;: disabling for now as I don't have an answer to the "how to find the hi
+       address on a bt_free call so that _bt_delete can be called" question */
+#if 0
+  void *t0a = bt_malloc(state, 10);
+  void *t0b = bt_malloc(state, 10);
+  bt_free(state, t0a);
+  bt_free(state, t0b);
+  /* memory freelist got coallesced. next malloc call should find the same range
+     and result in attempting to insert a range that overlaps a non-coallesced
+     region */
+  void *t0ab = bt_malloc(state, 20);
+  /* t0a should have the same address as t0ab */
+  assert(t0a == t0ab);
+#endif
+
+  /* ;;: can still suitably test by calling insert and delete routines directly */
+  _bt_insert(state, 0x1000, 0x4000, 4);
+  _bt_insert(state, 0x4000, 0x8000, 4);
+  _bt_delete(state, 0x1000, 0x4000);
+  _bt_delete(state, 0x4000, 0x8000);
+  _bt_insert(state, 0x1000, 0x7000, 7);
+
+
   //// ===========================================================================
   ////                                    test1
+
+  bt_state_new(&state);
+  assert(SUCC(bt_state_open(state, "./pmatest", 0, 0644)));
+  void * xxx = bt_malloc(state, 10); /* tmp - testing malloc logic */
+
 
   /* splitting tests. Insert sufficient data to force splitting. breakpoint before
      that split is performed */
@@ -1848,9 +1956,9 @@ int main(int argc, char *argv[])
   assert(SUCC(bt_state_close(state)));
 
 
-  
-  //// ===========================================================================
-  ////                                    test2
+
+//// ===========================================================================
+////                                    test2
 
   assert(SUCC(bt_state_open(state, "./pmatest", 0, 644)));
   _mlist_read(state);
