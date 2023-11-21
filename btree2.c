@@ -47,6 +47,14 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 /* coalescing of memory freelist currently prohibited since we haven't
    implemented coalescing of btree nodes (necessary) */
 #define CAN_COALESCE 0
+/* ;;: remove once confident in logic and delete all code dependencies on
+     state->node_freelist */
+#define USE_NLIST 1
+#if USE_NLIST
+/* ;;: obviously this should be removed once we've fully switched over to the
+     nlist. And calls to _node_alloc should be updated to calls to _bt_nalloc */
+#define _node_alloc(...) _bt_nalloc(__VA_ARGS__)
+#endif
 
 #define ZERO(s, n) memset((s), 0, (n))
 
@@ -252,6 +260,13 @@ struct BT_mlistnode {
   BT_mlistnode *next;           /* next freelist node */
 };
 
+typedef struct BT_nlistnode BT_nlistnode;
+struct BT_nlistnode {
+  BT_page *va;                  /* virtual address */
+  size_t sz;                    /* size in pages */
+  BT_nlistnode *next;           /* next freelist node */
+};
+
 typedef struct BT_flistnode BT_flistnode;
 struct BT_flistnode {
   pgno_t pg;                    /* pgno - an offset in the persistent file */
@@ -282,7 +297,7 @@ struct BT_state {
   off_t         file_size;      /* the size of the pma file in bytes */
   pgno_t        frontier;       /* last non-free page in use by pma (exclusive) */
   unsigned int  which;          /* which double-buffered db are we using? */
-  BT_mlistnode *nlist;          /* node freelist */
+  BT_nlistnode *nlist;          /* node freelist */
   BT_mlistnode *mlist;          /* memory freelist */
   BT_flistnode *flist;          /* pma file freelist */
   /* ;;: for deletion coalescing:
@@ -357,6 +372,7 @@ _fo_get(BT_state *state, BT_page *node)
   return BY2FO(vaddr - start);
 }
 
+#ifndef USE_NLIST
 static BT_page *                /* ;;: change to return both a file and node offset as params to function. actual return value is error code */
 _node_alloc(BT_state *state)
 {
@@ -374,12 +390,37 @@ _node_alloc(BT_state *state)
   /* ZERO(state->node_freelist, BT_PAGESIZE); */
   return ++state->node_freelist;
 }
+#endif
 
 static BT_page *
-__node_alloc(BT_state *state)
+_bt_nalloc(BT_state *state)
+/* allocate a node in the node freelist */
 {
-  /* TODO implement node freelist rather than a bump pointer */
-  return 0;
+  BT_nlistnode **n = &state->nlist;
+
+  for (; *n; n = &(*n)->next) {
+    /* ;;: this assert is temporary. When partition striping is
+         implemented. Rather than assert, conditionally check if we're at the
+         end of the current stripe. If so, allocate a new region and append that
+         to the freelist. */
+    size_t width = (BYTE *)state->nlist - state->map;
+    assert(width < MBYTES(2));
+    /* perfect fit */
+    if ((*n)->sz == 1) {
+      BT_page *ret;
+      ret = (*n)->va;
+      *n = (*n)->next;
+      return ret;
+    }
+    /* larger than necessary: shrink the node */
+    if ((*n)->sz > 1) {
+      BT_page *ret;
+      ret = (*n)->va;
+      (*n)->sz -= 1;
+      (*n)->va = (*n)->va + 1;
+      return ret;
+    }
+  }
 }
 
 /* ;;: from our usage, _node_cow no longer needs to take indirect pointer to
@@ -925,6 +966,38 @@ _flist_new(BT_state *state)
   return BT_SUCC;
 }
 
+#if USE_NLIST
+static int
+_nlist_new(BT_state *state)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  return 255;
+}
+
+static int
+_nlist_read(BT_state *state)
+{
+  /* ;;: this should theoretically be simpler than _mlist_read. right? We can
+     derive the stripes that contain nodes from the block base array stored in
+     the metapage. What else do we need to know? -- the parts of each stripe
+     that are free or in use. How can we discover that?
+
+     1) Without storing any per-page metadata, we could walk the entire tree
+     from the root. Check the page number of the node. And modify the freelist
+     accordingly.
+
+     2) If we stored per-page metadata, this would be simpler. Linearly traverse
+     each stripe and check if the page is BT_NODE or BT_FREE.
+
+     -- are there downsides to (2)? The only advantage to this would be quicker
+        startup. So for now, going to traverse all nodes and for each node,
+        traverse the nlist and split it appropriately.
+  */
+
+  return 255;
+}
+#endif
+
 static BT_mlistnode *
 _mlist_read2(BT_state *state, BT_page *node, uint8_t maxdepth, uint8_t depth)
 {
@@ -1335,6 +1408,7 @@ _bt_state_meta_new(BT_state *state)
 
   TRACE();
 
+  /* ;;: HERE HERE HERE: call node_alloc */
   root = &((BT_page *)state->map)[INITIAL_ROOTPG];
   _bt_root_new(root);
 
@@ -1393,9 +1467,19 @@ _bt_state_load(BT_state *state)
   state->meta_pages[0] = METADATA(p);
   state->meta_pages[0] = METADATA(p + 1);
 
+#ifndef USE_NLIST
   state->node_freelist = &((BT_page *)state->map)[3]; /* begin allocating nodes
                                                        on third page (first two
-                                                       are for metadata) */
+                                                       are for metadata) -- this
+                                                       was quite dumb. This is
+                                                       the fourth page of
+                                                       course. But it worked,
+                                                       because in _bt_root_new
+                                                       we use the third page
+                                                       without calling the
+                                                       allocation function */
+#endif
+
   /* new db, so populate metadata */
   if (new) {
     /* ;;: move this logic to _flist_new */
@@ -1405,6 +1489,10 @@ _bt_state_load(BT_state *state)
       return errno;
 
     state->file_size = PMA_GROW_SIZE;
+
+#if USE_NLIST
+    _nlist_new(state);
+#endif
 
     if (!SUCC(rc = _bt_state_meta_new(state))) {
       munmap(state->map, BT_ADDRSIZE);
@@ -1425,6 +1513,11 @@ _bt_state_load(BT_state *state)
   else {
     _mlist_read(state);
     _flist_read(state);
+#if USE_NLIST
+    /* ;;: this might need to be re-ordered given that _nlist_new needs to be
+         called before _bt_state_meta_new. Haven't thought about it yet. */
+    _nlist_read(state);
+#endif
   }
 
   return BT_SUCC;
