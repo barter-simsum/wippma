@@ -104,6 +104,7 @@ STATIC_ASSERT(0, "debugger break instruction unimplemented");
 #define BT_PAGEBITS 14ULL
 #define BT_PAGEWORD 32ULL
 #define BT_PAGESIZE (1ULL << BT_PAGEBITS) /* 16K */
+#define BT_NUMMETAS 2                     /* 2 metapages */
 #define BT_ADDRSIZE (BT_PAGESIZE << BT_PAGEWORD)
 #define PMA_GROW_SIZE (BT_PAGESIZE * 1024)
 
@@ -222,7 +223,7 @@ static_assert(BT_DAT_MAXBYTES % sizeof(BT_dat) == 0);
    a meta page is like any other page, but the data section is used to store
    additional information
 */
-#define BLK_BASE_LEN0 MBYTES(2)
+#define BLK_BASE_LEN0 (MBYTES(2) - (BT_PAGESIZE * BT_NUMMETAS))
 #define BLK_BASE_LEN1 (BLK_BASE_LEN0 * 4)
 #define BLK_BASE_LEN2 (BLK_BASE_LEN1 * 4)
 #define BLK_BASE_LEN3 (BLK_BASE_LEN2 * 4)
@@ -240,6 +241,10 @@ struct BT_meta {
   void     *fix_addr;           /* fixed addr of btree */
 
   pgno_t   blk_base[8];         /* block base array for striped node partition */
+
+  /* ;;: for the blk_base array, code may be simpler if this were an array of
+       BT_page *. */
+
   uint8_t  blk_cnt;             /* currently highest valid block base */
   uint8_t  depth;               /* tree depth */
 #define BP_DIRTY ((uint8_t)0x01) /* ;;: TODO remove dirty flag */
@@ -969,9 +974,118 @@ _flist_new(BT_state *state)
 #if USE_NLIST
 static int
 _nlist_new(BT_state *state)
+#define NLIST_PG_START 2        /* the third page */
 {
   BT_meta *meta = state->meta_pages[state->which];
-  return 255;
+  BT_nlistnode *head = calloc(1, sizeof *head);
+
+  /* the size of a new node freelist is just the first stripe length */
+  head->sz = BLK_BASE_LEN0;
+  head->va = &((BT_page *)state->map)[BT_NUMMETAS];
+  head->next = 0;
+
+  state->nlist = head;
+
+  return BT_SUCC;
+}
+
+static BT_nlistnode *
+_nlist_read_prev(BT_nlistnode *head, BT_nlistnode *curr)
+{
+  /* find nlist node preceding curr and return it */
+  BT_nlistnode *p, *n;
+  p = head;
+  n = head->next;
+  for (; n; p = n, n = n->next) {
+    if (n == curr)
+      return p;
+  }
+  return 0;
+}
+
+/* TODO this is a pretty bad algorithm in terms of time complexity. It should be
+   fixed, but isn't necessary now as our nlist is quite small. You may want to
+   consider making nlist doubly linked or incorporate a sort and merge step. */
+static int
+_nlist_read2(BT_state *state, BT_page *node, uint8_t maxdepth,
+             BT_nlistnode *head, uint8_t depth)
+/* recursively walk all nodes in the btree. Allocating new nlist nodes when a
+   node is found to be in a stripe unaccounted for. For each node found,
+   split/shrink the appropriate node to account for the allocated page */
+{
+  BT_nlistnode *p, *n;
+  p = head;
+  n = head->next;
+
+  /* find the nlist node that fits the current btree node */
+  for (; n; p = n, n = n->next) {
+    if (p->va <= node && p->va + p->sz > node)
+      break;
+  }
+
+  /* if the nlist node is only one page wide, it needs to be freed */
+  if (p->sz == 1) {
+    BT_nlistnode *prev = _nlist_read_prev(head, p);
+    prev->next = p->next;
+    free(p);
+    goto e;
+  }
+
+  /* if the btree node resides at the end of the nlist node, just shrink it */
+  BT_page *last = p->va + p->sz - 1;
+  if (last == node) {
+    p->sz -= 1;
+    goto e;
+  }
+
+  /* if the btree node resides at the start of the nlist node, likewise shrink
+     it and update the va */
+  if (p->va == node) {
+    p->sz -= 1;
+    p->va += 1;
+    goto e;
+  }
+
+  /* otherwise, need to split the current nlist node */
+  BT_nlistnode *right = calloc(1, sizeof *right);
+  size_t lsz = node - p->va;
+  size_t rsz = (p->va + p->sz) - node;
+  /* remove 1 page from the right nlist node's size to account for the allocated
+     btree node */
+  rsz -= 1;
+  assert(lsz > 0 && rsz > 0);
+
+  /* update the size of the left node. And set the size and va of the right
+     node. Finally, insert the new nlist node into the nlist. */
+  p->sz = lsz;
+  right->sz = rsz;
+  right->va = node + 1;
+  right->next = p->next;
+  p->next = right;
+
+ e:
+  /* if at a leaf, we're finished */
+  if (depth == maxdepth) {
+    return BT_SUCC;
+  }
+
+  /* otherwise iterate over all child nodes, recursively constructing the
+     list */
+  int rc = BT_SUCC;
+  for (size_t i = 0; i < BT_DAT_MAXKEYS; i++) {
+    BT_kv kv = node->datk[i];
+    BT_page *child = _node_get(state, node->datk[i].fo);
+    if (!child) continue;
+    if (!SUCC(rc = _nlist_read2(state,
+                                child,
+                                maxdepth,
+                                head,
+                                depth+1)))
+      return rc;
+  }
+
+  /* all children traversed */
+  return BT_SUCC;
 }
 
 static int
@@ -994,7 +1108,23 @@ _nlist_read(BT_state *state)
         traverse the nlist and split it appropriately.
   */
 
-  return 255;
+  int rc = BT_SUCC;
+  BT_meta *meta = state->meta_pages[state->which];
+  BT_page *root = _node_get(state, meta->root);
+
+  /* ;;: since partition striping isn't implemented yet, simplifying code by
+     assuming all nodes reside in the 2M region */
+  BT_nlistnode *head = calloc(1, sizeof *head);
+  head->sz = BLK_BASE_LEN0;
+  head->va = &((BT_page *)state->map)[BT_NUMMETAS];
+  head->next = 0;
+
+  if (!SUCC(rc = _nlist_read2(state, root, meta->depth, head, 1)))
+    return rc;
+
+  state->nlist = head;
+
+  return rc;
 }
 #endif
 
@@ -1409,7 +1539,7 @@ _bt_state_meta_new(BT_state *state)
   TRACE();
 
   /* ;;: HERE HERE HERE: call node_alloc */
-  root = &((BT_page *)state->map)[INITIAL_ROOTPG];
+  root = _node_alloc(state);
   _bt_root_new(root);
 
   pagesize = sizeof *p1;
@@ -1423,8 +1553,11 @@ _bt_state_meta_new(BT_state *state)
   meta.blk_cnt = 1;
   meta.depth = 1;
   meta.flags = BP_META;
-  /* meta.root = UINT32_MAX;      /\* ;;: actually should probably be 0 *\/ */
-  meta.root = INITIAL_ROOTPG;
+  meta.root = _fo_get(state, root);
+  assert(meta.root == INITIAL_ROOTPG); /* ;;: remove?? */
+
+  /* initialize the block base array */
+  meta.blk_base[0] = BT_NUMMETAS + 1;
 
   /* initialize the metapages */
   p1 = &((BT_page *)state->map)[0];
@@ -1491,7 +1624,8 @@ _bt_state_load(BT_state *state)
     state->file_size = PMA_GROW_SIZE;
 
 #if USE_NLIST
-    _nlist_new(state);
+    /* ;;: necessary to call this before _bt_state_meta_new */
+    assert(SUCC(_nlist_new(state)));
 #endif
 
     if (!SUCC(rc = _bt_state_meta_new(state))) {
@@ -1507,16 +1641,16 @@ _bt_state_load(BT_state *state)
   }
 
   if (new) {
-    _mlist_new(state);
-    _flist_new(state);
+    assert(SUCC(_mlist_new(state)));
+    assert(SUCC(_flist_new(state)));
   }
   else {
-    _mlist_read(state);
-    _flist_read(state);
+    assert(SUCC(_mlist_read(state)));
+    assert(SUCC(_flist_read(state)));
 #if USE_NLIST
     /* ;;: this might need to be re-ordered given that _nlist_new needs to be
          called before _bt_state_meta_new. Haven't thought about it yet. */
-    _nlist_read(state);
+    assert(SUCC(_nlist_read(state)));
 #endif
   }
 
