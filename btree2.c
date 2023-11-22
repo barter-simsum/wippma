@@ -317,7 +317,7 @@ struct BT_state {
   */
 
   BT_flistnode *pending_flist;
-  BT_mlistnode *pending_nlist;
+  BT_nlistnode *pending_nlist;
 };
 
 /*
@@ -1876,7 +1876,7 @@ _bt_delco_1pass_0(BT_state *state, vaof_t lo, vaof_t hi,
   return BT_SUCC;
 }
 
-int
+static int
 _bt_delco_1pass(BT_state *state, vaof_t lo, vaof_t hi)
 /* returns true if the leaves in the given range are all free (pgno of 0). false
    otherwise. This must be the case for an insert into an overlapping range to
@@ -1886,6 +1886,94 @@ _bt_delco_1pass(BT_state *state, vaof_t lo, vaof_t hi)
   BT_page *root = _node_get(state, meta->root);
   return _bt_delco_1pass_0(state, lo, hi, root, 1);
 }
+
+#define pendling_nlist_insert(state, pg) /* TODO */
+
+
+/* ;;: todo move shit around */
+static void
+_bt_delco_droptree2(BT_state *state, pgno_t nodepg, uint8_t depth, uint8_t maxdepth)
+{
+  /* branch */
+  if (depth != maxdepth) {
+    BT_page *node = _node_get(state, nodepg);
+    for (size_t i = 0; i < BT_DAT_MAXKEYS; i++) {
+      BT_kv entry = node->datk[i];
+      if (entry.fo == 0)
+        break;                  /* done */
+      _bt_delco_droptree2(state, entry.fo, depth+1, maxdepth);
+    }
+  }
+
+  pendling_nlist_insert(state, nodepg);
+}
+
+
+static void
+_bt_delco_droptree(BT_state *state, pgno_t nodepg, uint8_t depth)
+{
+  /* completely drop a tree. Assume that all leaves under the tree are free
+     (pgno = 0) */
+  assert(nodepg >= 2);
+  BT_meta *meta = state->meta_pages[state->which];
+  return _bt_delco_droptree2(state, nodepg, depth, meta->depth);
+}
+
+static void
+_bt_delco_trim_lsubtree_rhs2(BT_state *state, vaof_t lo, vaof_t hi,
+                            pgno_t nodepg, uint8_t depth, uint8_t maxdepth)
+{
+  BT_page *node = _node_get(state, nodepg);
+  size_t loidx = 0;
+
+  size_t i;
+  for (i = 0; i < BT_DAT_MAXKEYS-1; i++) {
+    vaof_t llo = node->datk[i].va;
+    if (llo <= lo) {
+      loidx = i;
+      break;
+    }
+  }
+
+  /* set the hi address of datk[loidx] to hi */
+  node->datk[loidx+1].va = hi;
+
+  if (depth != maxdepth) {
+    /* recur and droptree for branches */
+    for (i = loidx+1; i < BT_DAT_MAXKEYS-1; i++) {
+      pgno_t childpg = node->datk[i].fo;
+      if (childpg == 0)
+        break;
+      _bt_delco_droptree(state, childpg, depth+1);
+    }
+  }
+
+  /* always zero rhs whether node is a leaf or a branch */
+  BYTE *beg = (BYTE *)&node->datk[loidx+1].fo;
+  BYTE *end = (BYTE *)&node->datk[BT_DAT_MAXKEYS-1].fo;
+  size_t len = end - beg;
+
+  ZERO(beg, len);
+  /* ;;: this won't zero the last fo, but that should be fine. remove the assert
+       when you're confident it /is/ fine */
+  assert(node->datk[BT_DAT_MAXKEYS-1].fo == 0);
+
+  /* done if this is a leaf */
+  if (depth == maxdepth)
+    return;
+  /* otherwise, recur on the left subtree */
+  pgno_t lsubtree = node->datk[loidx].fo;
+  return _bt_delco_trim_lsubtree_rhs2(state, lo, hi, lsubtree, depth+1, maxdepth);
+}
+
+static void
+_bt_delco_trim_lsubtree_rhs(BT_state *state, vaof_t lo, vaof_t hi,
+                            pgno_t nodepg, uint8_t depth)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  return _bt_delco_trim_lsubtree_rhs2(state, lo, hi, nodepg, depth, meta->depth);
+}
+
 
 
 //// ===========================================================================
