@@ -290,7 +290,6 @@ struct BT_state {
   char         *path;
   ULONG         branch_page_cnt; /* ;;: rem */
   ULONG         leaf_page_cnt;   /* ;;: rem */
-  ULONG         depth;           /* ;;: rem */
   void         *fixaddr;
   BYTE         *map;
   BT_page      *node_freelist;
@@ -1783,14 +1782,14 @@ _bt_sync_meta(BT_state *state)
 }
 
 static int
-_bt_sync(BT_state *state, BT_page *node, uint8_t depth)
+_bt_sync(BT_state *state, BT_page *node, uint8_t depth, uint8_t maxdepth)
 /* recursively syncs the subtree under node. The caller is expected to sync node
    itself and mark it clean. */
 {
   int rc = 0;
 
   /* leaf */
-  if (depth == state->depth) {
+  if (depth == maxdepth) {
     _bt_sync_leaf(state, node);
     return BT_SUCC;
   }
@@ -1803,7 +1802,7 @@ _bt_sync(BT_state *state, BT_page *node, uint8_t depth)
     BT_page *child = _node_get(state, node->datk[i].fo);
 
     /* recursively sync the child's data */
-    if (rc = _bt_sync(state, child, depth+1))
+    if (rc = _bt_sync(state, child, depth+1, maxdepth))
       return rc;
 
     /* sync the child node */
@@ -1826,7 +1825,7 @@ _bt_sync(BT_state *state, BT_page *node, uint8_t depth)
 
 int
 _bt_delco_1pass_0(BT_state *state, vaof_t lo, vaof_t hi,
-                  BT_page *node, uint8_t depth)
+                  BT_page *node, uint8_t depth, uint8_t maxdepth)
 {
   /* Perform a dfs search on all ranges that fall within lo and hi */
 
@@ -1860,14 +1859,14 @@ _bt_delco_1pass_0(BT_state *state, vaof_t lo, vaof_t hi,
     pgno_t pg = node->datk[i].va;
 
     /* if at the leaf level, terminate with failure if pg is not free */
-    if (depth == state->depth) {
+    if (depth == maxdepth) {
       if (pg != 0) return 1;
       else continue;
     }
 
     /* otherwise, dfs the child node */
     BT_page *child = _node_get(state, pg);
-    if (!SUCC(_bt_delco_1pass_0(state, lo, hi, child, depth+1)))
+    if (!SUCC(_bt_delco_1pass_0(state, lo, hi, child, depth+1, maxdepth)))
       return 1;
   }
 
@@ -1884,10 +1883,33 @@ _bt_delco_1pass(BT_state *state, vaof_t lo, vaof_t hi)
 {
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
-  return _bt_delco_1pass_0(state, lo, hi, root, 1);
+  return _bt_delco_1pass_0(state, lo, hi, root, 1, meta->depth);
 }
 
-#define pendling_nlist_insert(state, pg) /* TODO */
+/* #define _pending_nlist_insert(state, pg) /\* TODO *\/ */
+
+static void
+_pending_nlist_insert(BT_state *state, pgno_t nodepg)
+{
+  BT_nlistnode *head = state->pending_nlist;
+  BT_page *va = _node_get(state, nodepg);
+
+  /* we don't need to account for a freelist node's size because we aren't
+     coalescing the pending freelists */
+  while (head->next) {
+    if (head->next->va > va)
+      break;
+    head = head->next;
+  }
+
+  /* head->next is either null or has a higher address than va */
+  BT_nlistnode *new = calloc(1, sizeof new);
+  new->next = head->next;
+  new->sz = 1;
+  new->va = va;
+
+  head->next = new;
+}
 
 
 /* ;;: todo move shit around */
@@ -1905,7 +1927,7 @@ _bt_delco_droptree2(BT_state *state, pgno_t nodepg, uint8_t depth, uint8_t maxde
     }
   }
 
-  pendling_nlist_insert(state, nodepg);
+  _pending_nlist_insert(state, nodepg);
 }
 
 
@@ -1920,12 +1942,71 @@ _bt_delco_droptree(BT_state *state, pgno_t nodepg, uint8_t depth)
 }
 
 static void
+_bt_delco_trim_rsubtree_lhs2(BT_state *state, vaof_t lo, vaof_t hi,
+                            pgno_t nodepg, uint8_t depth, uint8_t maxdepth)
+{
+  BT_page *node = _node_get(state, nodepg);
+  size_t hiidx = 0;
+
+  /* find hi idx of range */
+  size_t i;
+  for (i = 0; i < BT_DAT_MAXKEYS-1; i++) {
+    vaof_t hhi = node->datk[i].va;
+    if (hhi >= hi) {
+      hiidx = i;
+      break;
+    }
+  }
+
+  /* set the lo address of datk[hiidx] to hi */
+  node->datk[hiidx-1].va = hi;
+
+  /* drop the subtrees left of the range */
+  if (depth != maxdepth) {
+    for (i = 0; i < hiidx-1; i++) {
+      pgno_t childpg = node->datk[i].fo;
+      if (childpg == 0)
+        break;
+      _bt_delco_droptree(state, childpg, depth+1);
+    }
+  }
+
+  /* memmove the buffer so the found range is the first in the node */
+  BYTE *beg = (BYTE *)&node->datk[hiidx-1].va;
+  BYTE *end = (BYTE *)&node->datk[BT_DAT_MAXKEYS-1].fo;
+  size_t len = end - beg;
+
+  memmove(&node->datk[0].va, beg, len);
+
+  /* ;;: TODO add temporary asserts for testing? */
+
+  /* and now zero the moved range */
+  ZERO(beg, len);
+
+  /* done if this is a leaf */
+  if (depth == maxdepth)
+    return;
+  /* otherwise, recur on subtree */
+  pgno_t rsubtree = node->datk[hiidx].fo;
+  return _bt_delco_trim_rsubtree_lhs2(state, lo, hi, rsubtree, depth+1, maxdepth);
+}
+
+static void
+_bt_delco_trim_rsubtree_lhs(BT_state *state, vaof_t lo, vaof_t hi,
+                            pgno_t nodepg, uint8_t depth)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  return _bt_delco_trim_rsubtree_lhs2(state, lo, hi, nodepg, depth, meta->depth);
+}
+
+static void
 _bt_delco_trim_lsubtree_rhs2(BT_state *state, vaof_t lo, vaof_t hi,
                             pgno_t nodepg, uint8_t depth, uint8_t maxdepth)
 {
   BT_page *node = _node_get(state, nodepg);
   size_t loidx = 0;
 
+  /* find low idx of range */
   size_t i;
   for (i = 0; i < BT_DAT_MAXKEYS-1; i++) {
     vaof_t llo = node->datk[i].va;
@@ -1938,6 +2019,7 @@ _bt_delco_trim_lsubtree_rhs2(BT_state *state, vaof_t lo, vaof_t hi,
   /* set the hi address of datk[loidx] to hi */
   node->datk[loidx+1].va = hi;
 
+  /* drop the subtrees right of the range */
   if (depth != maxdepth) {
     /* recur and droptree for branches */
     for (i = loidx+1; i < BT_DAT_MAXKEYS-1; i++) {
@@ -2106,7 +2188,7 @@ bt_sync(BT_state *state)
   BT_page *root = _node_get(state, meta->root);
   int rc = 0;
 
-  if (rc = _bt_sync(state, root, 1))
+  if (rc = _bt_sync(state, root, 1, meta->depth))
     return rc;
 
   /* sync the root page */
