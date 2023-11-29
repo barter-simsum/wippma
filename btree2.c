@@ -247,11 +247,12 @@ struct BT_meta {
 
   uint8_t  blk_cnt;             /* currently highest valid block base */
   uint8_t  depth;               /* tree depth */
-#define BP_DIRTY ((uint8_t)0x01) /* ;;: TODO remove dirty flag */
+/* #define BP_DIRTY ((uint8_t)0x01) /\* ;;: TODO remove dirty flag *\/ */
 #define BP_META  ((uint8_t)0x02)
   uint8_t  flags;
   uint8_t  _pad1;
   pgno_t   root;
+  /* ;;: confirm: shouldn't the checksum actually follow the roots array? */
   uint32_t chk;                 /* checksum */
   /* 64bit alignment manually checked */
   uint64_t roots[];             /* for usage by ares */
@@ -260,6 +261,9 @@ struct BT_meta {
 
 } __packed;
 static_assert(sizeof(BT_meta) <= BT_DAT_MAXBYTES);
+
+/* the length of the metapage up to but excluding the checksum */
+#define BT_META_LEN (offsetof(BT_meta, chk))
 
 #define BT_roots_bytelen (sizeof(BT_meta) - offsetof(BT_meta, roots))
 
@@ -1019,7 +1023,8 @@ _bt_delco(BT_state *state, vaof_t lo, vaof_t hi,
 
   size_t loidx = 0;
   size_t hiidx = 0;
-
+  pgno_t lsubtree = 0;
+  pgno_t rsubtree = 0;
 
   /* find low idx of range */
   for (size_t i = 0; i < BT_DAT_MAXKEYS-1; i++) {
@@ -1046,8 +1051,30 @@ _bt_delco(BT_state *state, vaof_t lo, vaof_t hi,
     return;
   }
 
-  if (depth != maxdepth) {
-    /* ;;: handle cow/dirty */
+  lsubtree = node->datk[loidx].fo;
+  rsubtree = node->datk[hiidx].fo;
+
+  if (depth < maxdepth) {
+    /* guarantee path is dirty by CoWing node if not */
+
+    /* ;;: refactor? code duplication?? */
+    if (!_bt_ischilddirty(node, loidx)) {
+      BT_page *child = _node_get(state, lsubtree);
+      BT_page *new;
+      pgno_t newpg;
+      _node_cow(state, child, &new, &newpg);
+      lsubtree = node->datk[loidx].fo = newpg;
+      _bt_dirtychild(node, loidx);
+    }
+
+    if (!_bt_ischilddirty(node, hiidx)) {
+      BT_page *child = _node_get(state, rsubtree);
+      BT_page *new;
+      pgno_t newpg;
+      _node_cow(state, child, &new, &newpg);
+      rsubtree = node->datk[hiidx].fo = newpg;
+      _bt_dirtychild(node, hiidx);
+    }
   }
 
   /* non-split range, recurse to child tree */
@@ -1064,9 +1091,6 @@ _bt_delco(BT_state *state, vaof_t lo, vaof_t hi,
       assert(0);
     }
 
-    pgno_t lsubtree = node->datk[loidx].fo;
-    pgno_t rsubtree = node->datk[hiidx].fo;
-
     /* set leftmost boundary va to hi */
     node->datk[loidx+1].va = hi;
 
@@ -1080,7 +1104,6 @@ _bt_delco(BT_state *state, vaof_t lo, vaof_t hi,
     }
 
     /* move buffer */
-    /* ;;: careful of obo. -- confirm this is correct */
     BYTE *dst = (BYTE *)&node->datk[loidx+1].va;
     BYTE *src = (BYTE *)&node->datk[hiidx].va;
     BYTE *end = (BYTE *)&node->datk[BT_DAT_MAXKEYS-1].fo;
@@ -1172,34 +1195,23 @@ _bt_insert(BT_state *state, vaof_t lo, vaof_t hi, pgno_t fo)
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
 
+  /* the root MUST be dirty (zero checksum in metapage) */
+  assert(meta->chk == 0);
+
   size_t N = _bt_numkeys(root);
 
-  /* if the root isn't dirty, cow it and flip the which */
-  if (!(meta->flags & BP_DIRTY)) {
-    BT_page *newroot;
-    pgno_t  newrootpg;
-
-    if (!SUCC(rc = _node_cow(state, root, &newroot, &newrootpg)))
-      return rc;
-
-    /* ;;: _bt_sync_meta handles switching which metapage is currently being
-         used. That should not be done in _bt_insert. We should, however, handle
-         dirtying the root via the BP_DIRTY metapage flag and cowing the root.
-
-         TODO
-
-       */
-    /* switch to other metapage and dirty it */
-    /* state->which = state->which ? 0 : 1; */
-    /* meta = state->meta_pages[state->which]; */
-    meta->flags |= BP_DIRTY;
-    meta->root = newrootpg;
-    root = newroot;
+  /* perform deletion coalescing (and preemptively guarantee path is dirty) if
+     inserting a non-zero (non-free) page */
+  if (fo != 0) {
+    _bt_delco(state, lo, hi, meta->root, 1, meta->depth);
   }
 
   /* CoW root's child if it isn't already dirty */
   size_t childidx = _bt_childidx(root, lo, hi);
-  assert(childidx != BT_DAT_MAXKEYS);
+  assert(childidx != BT_DAT_MAXKEYS); /* ;;: this should catch the case of
+                                           improperly inserting into a split
+                                           range. Should we do it earlier or
+                                           differently? */
   if (meta->depth > 1
       && !_bt_ischilddirty(root, childidx)) {
     BT_page *child = _node_get(state, root->datk[childidx].fo);
@@ -1833,6 +1845,22 @@ _flist_delete(BT_state *state)
     fd = -1;                                    \
   } while(0)
 
+/* TODO: move to lib */
+static uint32_t
+nonzero_crc_32(void *dat, size_t len)
+{
+  unsigned char nonce = 0;
+  uint32_t chk = crc_32(dat, len);
+
+  do {
+    if (nonce > 8)
+      abort();
+    chk = update_crc_32(chk, nonce++);
+  } while (chk == 0);
+
+  return chk;
+}
+
 static int
 _bt_state_meta_which(BT_state *state, int *which)
 {
@@ -1840,17 +1868,11 @@ _bt_state_meta_which(BT_state *state, int *which)
   BT_meta *m2 = state->meta_pages[1];
   *which = -1;
 
-  if (m1->flags & BP_DIRTY
-      && m2->flags & BP_DIRTY) {
-    DPUTS("Error, both metapages dirty");
-    return EINVAL;
-  }
-
-  if (m1->flags & BP_DIRTY) {
+  if (m1->flags == 0) {
     /* first is dirty */
     *which = 1;
   }
-  else if (m2->flags & BP_DIRTY) {
+  else if (m2->flags == 0) {
     /* second is dirty */
     *which = 0;
   }
@@ -1858,9 +1880,20 @@ _bt_state_meta_which(BT_state *state, int *which)
     /* first is most recent */
     *which = 0;
   }
-  else {
-    /* otherwise, second is most recent */
+  else if (m1->txnid < m2->txnid) {
+    /* second is most recent */
     *which = 1;
+  }
+  else {
+    /* invalid state */
+    return EINVAL;
+  }
+
+  /* checksum the metapage found and abort if checksum doesn't match */
+  BT_meta *meta = state->meta_pages[*which];
+  uint32_t chk = nonzero_crc_32(meta, BT_META_LEN);
+  if (chk != meta->chk) {
+    abort();
   }
 
   return BT_SUCC;
@@ -1924,6 +1957,8 @@ _bt_state_read_header(BT_state *state)
 
   if (!SUCC(rc = _bt_state_meta_which(state, &which)))
     return rc;
+
+  state->which = which;
 
   return BT_SUCC;
 }
@@ -2153,12 +2188,12 @@ _bt_sync_meta(BT_state *state)
   BT_meta *meta = state->meta_pages[state->which];
   BT_meta *newmeta;
   uint32_t chk;
-  size_t len;
   int newwhich;
 
   /* checksum the metapage */
-  len = offsetof(BT_meta, chk);
-  chk = crc_32((unsigned char *)meta, len);
+  chk = nonzero_crc_32(meta, BT_META_LEN);
+  /* ;;: todo: guarantee the chk cannot be zero */
+
   meta->chk = chk;
 
   /* sync the metapage */
@@ -2171,10 +2206,17 @@ _bt_sync_meta(BT_state *state)
   newmeta->chk = 0;
 
   /* copy over metapage to new metapage excluding the checksum */
-  memcpy(newmeta, meta, len);
+  memcpy(newmeta, meta, BT_META_LEN);
 
-  /* ;;: tmp. remove assert. */
-  assert(newmeta->chk == 0);
+  /* CoW a new root since the root referred to by the metapage should always be
+     dirty */
+  BT_page *root, *newroot;
+  pgno_t newrootpg;
+  root = _node_get(state, newmeta->root);
+  if (!SUCC(_node_cow(state, root, &newroot, &newrootpg)))
+    abort();
+
+  newmeta->root = newrootpg;
 
   /* finally, switch the metapage we're referring to */
   state->which = newwhich;
@@ -2328,15 +2370,12 @@ bt_malloc(BT_state *state, size_t pages)
 }
 
 void
-bt_free(BT_state *state, void * p)
+bt_free(BT_state *state, void *lo, void *hi)
 {
-  vaof_t lo = ADDR2OFF(p);
-  /* ;;: next, need to determine hi address so that _bt_delete can be
-     called. How do we do this? Obviously, this isn't stored in the memory
-     freelist which tracks only freespace. But all btree operations we've
-     written are built on the premise that we have a lo and hi address. Is there
-     any way we can derive this without adding another ephemeral data structure
-     to track the bounds of allocations? */
+  vaof_t looff = ADDR2OFF(lo);
+  vaof_t hioff = ADDR2OFF(hi);
+  _bt_insert(state, looff, hioff, 0);
+  /* ;;: and now add freespace to state->flist. coalescing when you do so */
 }
 
 int
@@ -2355,14 +2394,27 @@ bt_sync(BT_state *state)
   if (msync(root, sizeof(BT_page), MS_SYNC))
     return errno;
 
-  /* set the root as clean */
-  meta->flags &= ~BP_DIRTY;
-
   /* then sync the metapage */
   if (rc = _bt_sync_meta(state))
     return rc;
 
   return BT_SUCC;
+}
+
+uint64_t
+bt_meta_get(BT_state *state, size_t idx)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  assert((uintptr_t)&meta->roots[idx] - (uintptr_t)&meta <= sizeof *meta);
+  return meta->roots[idx];
+}
+
+void
+bt_meta_set(BT_state *state, size_t idx, uint64_t val)
+{
+  BT_meta *meta = state->meta_pages[state->which];
+  assert((uintptr_t)&meta->roots[idx] - (uintptr_t)&meta <= sizeof *meta);
+  meta->roots[idx] = val;
 }
 
 
@@ -2404,7 +2456,7 @@ _sham_sync(BT_state *state)
   /* walk the tree and unset the dirty bit from all pages */
   BT_meta *meta = state->meta_pages[state->which];
   BT_page *root = _node_get(state, meta->root);
-  meta->flags ^= BP_DIRTY;      /* unset the meta dirty flag */
+  meta->chk = nonzero_crc_32(meta, BT_META_LEN);
   _sham_sync2(state, root, 1, meta->depth);
 }
 
